@@ -1,0 +1,19 @@
+services:
+  bot:
+    build: .
+    env_file:
+      - .env
+    environment:
+      INFERENCE_API_URL: ${INFERENCE_API_URL}
+      INFERENCE_API_KEY: ${INFERENCE_API_KEY}
+    restart: unless-stopped
+    expose:
+      - "8080"
+    networks:
+      tailscale-ingress:
+        aliases:
+          - ${WEBHOOK_DOCKER_ALIAS:?WEBHOOK_DOCKER_ALIAS must be set}
+
+networks:
+  tailscale-ingress:
+    external: true

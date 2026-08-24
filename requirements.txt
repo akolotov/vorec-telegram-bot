@@ -1,0 +1,5 @@
+python-telegram-bot[webhooks]>=22,<23
+python-dotenv>=1,<2
+gigaam-multilingual-mlx[server]
+imageio-ffmpeg>=0.6,<1
+openai>=1,<3
