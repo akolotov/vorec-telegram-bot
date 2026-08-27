@@ -1,6 +1,6 @@
 services:
   bot:
-    build: .
+    image: ghcr.io/akolotov/vorec-telegram-bot:latest
     env_file:
       - .env
     environment:

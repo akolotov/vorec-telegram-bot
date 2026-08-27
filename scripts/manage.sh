@@ -125,7 +125,7 @@ start() {
     wait_for_gigaam
     echo "GigaAM is ready. Starting Telegram bot container..."
     if ! INFERENCE_API_URL="$INFERENCE_API_URL" INFERENCE_API_KEY="$INFERENCE_API_KEY" \
-        docker compose --project-directory "$PROJECT_DIR" up -d --build --remove-orphans; then
+        docker compose --project-directory "$PROJECT_DIR" up -d --pull always --remove-orphans; then
         if [ "$gigaam_started" = true ]; then
             tmux kill-session -t "$GIGAAM_TMUX_SESSION" || true
         fi

@@ -83,9 +83,11 @@ The project deliberately has two dependency files:
   includes only the bot's runtime dependencies, including `python-telegram-bot[webhooks]` for
   the HTTP webhook server.
 
-Keeping them separate prevents Docker from trying to install macOS-only MLX dependencies. Build
-and start the container through `./scripts/manage.sh start`; it runs `docker compose up --build`
-after GigaAM is ready.
+Keeping them separate prevents Docker from trying to install macOS-only MLX dependencies.
+GitHub Actions builds and publishes the Linux image to GitHub Container Registry after changes
+are merged into `main` and when version tags are pushed. `./scripts/manage.sh start` pulls the
+latest published image through Docker Compose after GigaAM is ready; it does not build an image
+locally.
 
 ## First setup
 
@@ -117,4 +119,7 @@ Use one script to manage both services:
 ./scripts/manage.sh logs gigaam
 ```
 
-`start` runs GigaAM in a detached tmux session, checks its health endpoint, then starts the bot with Docker Compose and registers the Telegram webhook. `stop` stops the bot first and then GigaAM.
+`start` runs GigaAM in a detached tmux session, checks its health endpoint, then starts the bot
+with Docker Compose using `--pull always` and registers the Telegram webhook. This checks for a
+new published image on every start without building one locally. `stop` stops the bot first and
+then GigaAM.
