@@ -87,7 +87,8 @@ Keeping them separate prevents Docker from trying to install macOS-only MLX depe
 GitHub Actions builds and publishes the Linux image to GitHub Container Registry after changes
 are merged into `main` and when version tags are pushed. `./scripts/manage.sh start` pulls the
 latest published image through Docker Compose after GigaAM is ready; it does not build an image
-locally.
+locally. By default, Compose uses `ghcr.io/akolotov/vorec-telegram-bot:latest`; set
+`VOREC_BOT_IMAGE` in the shell or `.env` to run a specific published tag instead.
 
 ## First setup
 
@@ -120,6 +121,6 @@ Use one script to manage both services:
 ```
 
 `start` runs GigaAM in a detached tmux session, checks its health endpoint, then starts the bot
-with Docker Compose using `--pull always` and registers the Telegram webhook. This checks for a
-new published image on every start without building one locally. `stop` stops the bot first and
-then GigaAM.
+with Docker Compose and registers the Telegram webhook. The Compose service has
+`pull_policy: always`, so it checks for a new published image on every start without building one
+locally. `stop` stops the bot first and then GigaAM.
