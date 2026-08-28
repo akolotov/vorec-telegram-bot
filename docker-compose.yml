@@ -1,6 +1,7 @@
 services:
   bot:
-    build: .
+    image: ${VOREC_BOT_IMAGE:-ghcr.io/akolotov/vorec-telegram-bot:latest}
+    pull_policy: always
     env_file:
       - .env
     environment:
