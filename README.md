@@ -37,7 +37,8 @@ Telegram → Tailscale Funnel → tailscale-ingress → bot container → GigaAM
   can preserve English terms, anglicisms, and mixed Russian/English speech better in some
   recordings.
 - **GigaAM** produces a second transcription using the existing MLX model in the oMLX
-  cache. It is strong on Russian speech, but may transliterate English terms.
+  cache. It is strong on Russian speech, but may transliterate English terms. One native GigaAM
+  process can serve multiple bot deployments on the same Mac.
 - **Merge model** receives both transcripts through the inference provider and combines
   their best-supported readings into one readable result. Both transcriptions are always
   made: the bot does not currently try to judge the quality of the first result.
@@ -73,6 +74,11 @@ WEBHOOK_SECRET_TOKEN=replace_with_a_long_random_webhook_secret
 `WEBHOOK_DOCKER_ALIAS` must match the `<Docker network alias>` portion of `WEBHOOK_PATH`.
 The external `tailscale-ingress` Docker network must already exist before running `manage.sh`.
 
+Each deployment must also set a unique `COMPOSE_PROJECT_NAME`. Docker Compose uses this name to
+keep containers from different checkouts separate. A second deployment needs a different
+`TELEGRAM_BOT_TOKEN`, `COMPOSE_PROJECT_NAME`, `WEBHOOK_DOCKER_ALIAS`, and matching
+`WEBHOOK_PATH`.
+
 ## Docker build
 
 The project deliberately has two dependency files:
@@ -102,11 +108,15 @@ cp .env.example .env
 
 Configure `.env` with the Telegram token, allowed user IDs, API credentials, and unique webhook
 settings. For a second deployment, use a different `TELEGRAM_BOT_TOKEN`,
-`WEBHOOK_DOCKER_ALIAS`, and matching `WEBHOOK_PATH`.
+`COMPOSE_PROJECT_NAME`, `WEBHOOK_DOCKER_ALIAS`, and matching `WEBHOOK_PATH`. Both deployments
+can use the same healthy GigaAM process; configure the same `GIGAAM_URL`, `GIGAAM_API_KEY`, and
+`GIGAAM_PORT` in both. Set `GIGAAM_MANAGER_SCRIPT` in a secondary deployment to the absolute path
+of the checkout that owns that process.
 
-`manage.sh` does not install dependencies. It checks that `.venv`, Docker, tmux, and the GigaAM
-model directory exist before starting the services. Set `GIGAAM_MODEL_PATH` when the model is not
-stored in its default oMLX cache location.
+`manage.sh` does not install dependencies. It checks the local GigaAM health endpoint first. Only
+the GigaAM manager checks for `.venv`, tmux, and the model directory when it needs to start a new
+GigaAM process. Set `GIGAAM_MODEL_PATH` when the model is not stored in its default oMLX cache
+location.
 
 ## Management
 
@@ -115,12 +125,15 @@ Use one script to manage both services:
 ```sh
 ./scripts/manage.sh start
 ./scripts/manage.sh stop
+./scripts/manage.sh stop all
 ./scripts/manage.sh status
 ./scripts/manage.sh logs bot
 ./scripts/manage.sh logs gigaam
 ```
 
-`start` runs GigaAM in a detached tmux session, checks its health endpoint, then starts the bot
-with Docker Compose and registers the Telegram webhook. The Compose service has
-`pull_policy: always`, so it checks for a new published image on every start without building one
-locally. `stop` stops the bot first and then GigaAM.
+`start` checks the shared GigaAM health endpoint. It reuses a healthy process or starts GigaAM in
+a detached tmux session, then starts the bot with Docker Compose and registers the Telegram
+webhook. The Compose service has `pull_policy: always`, so it checks for a new published image on
+every start without building one locally. `stop` stops only this bot and leaves shared GigaAM
+running. `stop all` stops this bot and then stops the shared GigaAM process; use it only when no
+other deployment needs GigaAM.

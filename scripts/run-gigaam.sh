@@ -13,7 +13,7 @@ set -a
 set +a
 set -u
 
-GIGAAM_PORT=${GIGAAM_PORT:-8000}
+GIGAAM_PORT=${GIGAAM_PORT:-18000}
 GIGAAM_VARIANT=${GIGAAM_VARIANT:-int8}
 GIGAAM_MODEL_PATH=${GIGAAM_MODEL_PATH:-"$HOME/.omlx/models/ai-babai/gigaam-multilingual-mlx"}
 FFMPEG_PATH=$("$PYTHON" -c 'import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())')

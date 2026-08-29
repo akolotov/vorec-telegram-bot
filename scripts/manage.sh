@@ -4,11 +4,9 @@ set -eu
 
 PROJECT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 ENV_FILE="$PROJECT_DIR/.env"
-PYTHON="$PROJECT_DIR/.venv/bin/python"
-GIGAAM_COMMAND="$PROJECT_DIR/.venv/bin/gigaam-stt"
 
 usage() {
-    echo "Usage: $0 {start|stop|status|logs [bot|gigaam]}" >&2
+    echo "Usage: $0 {start|stop [all]|status|logs [bot|gigaam]}" >&2
     exit 2
 }
 
@@ -35,15 +33,14 @@ load_configuration() {
     require_env WEBHOOK_PATH
     require_env WEBHOOK_SECRET_TOKEN
     require_env ALLOWED_USER_IDS
+    require_env COMPOSE_PROJECT_NAME
     require_env GIGAAM_URL
     require_env GIGAAM_API_KEY
     require_env INFERENCE_API_URL
     require_env INFERENCE_API_KEY
 
-    GIGAAM_PORT=${GIGAAM_PORT:-8000}
-    GIGAAM_VARIANT=${GIGAAM_VARIANT:-int8}
-    GIGAAM_MODEL_PATH=${GIGAAM_MODEL_PATH:-"$HOME/.omlx/models/ai-babai/gigaam-multilingual-mlx"}
-    GIGAAM_TMUX_SESSION=${GIGAAM_TMUX_SESSION:-vorec-gigaam}
+    GIGAAM_PORT=${GIGAAM_PORT:-18000}
+    GIGAAM_MANAGER_SCRIPT=${GIGAAM_MANAGER_SCRIPT:-"$PROJECT_DIR/scripts/manage-gigaam.sh"}
 }
 
 require_env() {
@@ -54,81 +51,47 @@ require_env() {
     fi
 }
 
-require_commands() {
-    if [ ! -x "$PYTHON" ] || [ ! -x "$GIGAAM_COMMAND" ]; then
-        echo "Missing project dependencies. Run .venv/bin/python -m pip install -r requirements.txt." >&2
-        exit 1
-    fi
-    if ! command -v tmux >/dev/null; then
-        echo "tmux is required to run GigaAM in the background." >&2
-        exit 1
-    fi
+require_bot_dependencies() {
     if ! command -v docker >/dev/null; then
         echo "Docker is required to run the Telegram bot container." >&2
         exit 1
     fi
-    if [ ! -d "$GIGAAM_MODEL_PATH" ]; then
-        echo "GigaAM model directory was not found: $GIGAAM_MODEL_PATH" >&2
-        echo "Set GIGAAM_MODEL_PATH to the existing oMLX GigaAM model directory." >&2
+    if ! command -v curl >/dev/null; then
+        echo "curl is required to check the shared GigaAM service." >&2
         exit 1
     fi
 }
 
-gigaam_session_exists() {
-    tmux has-session -t "$GIGAAM_TMUX_SESSION" 2>/dev/null
+compose() {
+    docker compose --project-directory "$PROJECT_DIR" --project-name "$COMPOSE_PROJECT_NAME" "$@"
 }
 
 gigaam_is_ready() {
-    "$PYTHON" -c '
-import sys
-from urllib.request import urlopen
-
-try:
-    with urlopen(sys.argv[1], timeout=1) as response:
-        raise SystemExit(0 if response.status == 200 else 1)
-except OSError:
-    raise SystemExit(1)
-' "http://127.0.0.1:$GIGAAM_PORT/healthz"
+    curl --fail --silent --show-error --max-time 1 "http://127.0.0.1:$GIGAAM_PORT/healthz" >/dev/null 2>&1
 }
 
-wait_for_gigaam() {
-    attempt=0
-    while [ "$attempt" -lt 60 ]; do
-        if gigaam_is_ready; then
-            return 0
-        fi
-        if ! gigaam_session_exists; then
-            echo "GigaAM server exited before becoming ready." >&2
-            exit 1
-        fi
-        attempt=$((attempt + 1))
-        sleep 1
-    done
+ensure_gigaam() {
+    if gigaam_is_ready; then
+        echo "Using shared GigaAM service on port $GIGAAM_PORT."
+        return 0
+    fi
 
-    echo "GigaAM did not become ready within 60 seconds." >&2
-    exit 1
+    if [ ! -x "$GIGAAM_MANAGER_SCRIPT" ]; then
+        echo "GigaAM manager script is not executable: $GIGAAM_MANAGER_SCRIPT" >&2
+        exit 1
+    fi
+
+    echo "GigaAM is not ready. Starting it with $GIGAAM_MANAGER_SCRIPT..."
+    "$GIGAAM_MANAGER_SCRIPT" start
 }
 
 start() {
     load_configuration
-    require_commands
-    gigaam_started=false
-
-    if gigaam_session_exists; then
-        echo "GigaAM tmux session already exists: $GIGAAM_TMUX_SESSION"
-    else
-        echo "Starting GigaAM in tmux session: $GIGAAM_TMUX_SESSION"
-        tmux new-session -d -s "$GIGAAM_TMUX_SESSION" "$PROJECT_DIR/scripts/run-gigaam.sh"
-        gigaam_started=true
-    fi
-
-    wait_for_gigaam
+    require_bot_dependencies
+    ensure_gigaam
     echo "GigaAM is ready. Starting Telegram bot container..."
     if ! INFERENCE_API_URL="$INFERENCE_API_URL" INFERENCE_API_KEY="$INFERENCE_API_KEY" \
-        docker compose --project-directory "$PROJECT_DIR" up -d --remove-orphans; then
-        if [ "$gigaam_started" = true ]; then
-            tmux kill-session -t "$GIGAAM_TMUX_SESSION" || true
-        fi
+        compose up -d --remove-orphans; then
         exit 1
     fi
     echo "Service is running. Use '$0 status' to inspect it."
@@ -139,12 +102,14 @@ stop() {
 
     if command -v docker >/dev/null; then
         echo "Stopping Telegram bot container..."
-        docker compose --project-directory "$PROJECT_DIR" down --remove-orphans
+        compose down --remove-orphans
     fi
 
-    if command -v tmux >/dev/null && gigaam_session_exists; then
-        echo "Stopping GigaAM tmux session: $GIGAAM_TMUX_SESSION"
-        tmux kill-session -t "$GIGAAM_TMUX_SESSION"
+    if [ "${1:-}" = all ]; then
+        echo "Stopping the shared GigaAM service..."
+        "$GIGAAM_MANAGER_SCRIPT" stop
+    else
+        echo "GigaAM remains running. Use '$0 stop all' to stop the shared GigaAM service."
     fi
 }
 
@@ -152,20 +117,15 @@ status() {
     load_configuration
     failed=false
 
-    if command -v tmux >/dev/null && gigaam_session_exists; then
-        if gigaam_is_ready; then
-            echo "GigaAM: ready (tmux session $GIGAAM_TMUX_SESSION)"
-        else
-            echo "GigaAM: tmux session exists, but the API is not ready"
-            failed=true
-        fi
+    if gigaam_is_ready; then
+        echo "GigaAM: ready on port $GIGAAM_PORT"
     else
         echo "GigaAM: stopped"
         failed=true
     fi
 
     if command -v docker >/dev/null; then
-        docker compose --project-directory "$PROJECT_DIR" ps
+        compose ps
     else
         echo "Docker: command not found"
         failed=true
@@ -180,14 +140,10 @@ logs() {
     load_configuration
     case ${1:-bot} in
         bot)
-            docker compose --project-directory "$PROJECT_DIR" logs --tail=100 -f
+            compose logs --tail=100 -f
             ;;
         gigaam)
-            if ! gigaam_session_exists; then
-                echo "GigaAM tmux session is not running." >&2
-                exit 1
-            fi
-            tmux capture-pane -p -t "$GIGAAM_TMUX_SESSION" -S -100
+            "$GIGAAM_MANAGER_SCRIPT" logs
             ;;
         *)
             usage
@@ -200,7 +156,14 @@ case ${1:-} in
         start
         ;;
     stop)
-        stop
+        case ${2:-} in
+            ""|all)
+                stop "${2:-}"
+                ;;
+            *)
+                usage
+                ;;
+        esac
         ;;
     status)
         status

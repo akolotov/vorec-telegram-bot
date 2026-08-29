@@ -16,6 +16,6 @@ Apply YAGNI and KISS: implement only what is needed, using the simplest clear so
 
 # Local Bot Runtime
 
-For local end-to-end tests, run `./scripts/manage.sh start` from the project root outside the sandbox. It starts native GigaAM and the Docker Compose bot with the current `.env`, including webhook registration.
+For local end-to-end tests, run `./scripts/manage.sh start` from the project root outside the sandbox. It reuses healthy shared GigaAM or starts it, then starts the Docker Compose bot with the current `.env`, including webhook registration.
 
-Before starting, verify required local configuration is present without exposing its values. For a test deployment, `WEBHOOK_DOCKER_ALIAS` must differ from production and end in `-test`; `WEBHOOK_PATH` must contain that exact alias. Never start if either value matches production. Do not use `docker run`, invoke Compose directly, or replace the configured runtime with synthetic settings.
+Before starting, verify required local configuration is present without exposing its values. For a test deployment, `COMPOSE_PROJECT_NAME` and `WEBHOOK_DOCKER_ALIAS` must differ from production; the alias must end in `-test`, and `WEBHOOK_PATH` must contain it. Never start if either value matches production. Do not use `docker run`, invoke Compose directly, or replace the configured runtime with synthetic settings. Do not run `manage.sh stop all` without explicit user approval.
