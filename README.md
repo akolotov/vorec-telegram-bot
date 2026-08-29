@@ -95,19 +95,24 @@ The project deliberately has two dependency files:
   includes only the bot's runtime dependencies, including `python-telegram-bot[webhooks]` for
   the HTTP webhook server.
 
-Keeping them separate prevents Docker from trying to install macOS-only MLX dependencies.
+Keeping them separate prevents Docker from trying to install macOS-only MLX dependencies. The
+local GigaAM runtime requires an Apple Silicon Mac running macOS 14 or later and Python 3.12 or
+3.13.
 GitHub Actions builds and publishes the Linux image to GitHub Container Registry after changes
 are merged into `main` and when version tags are pushed. `./scripts/manage.sh start` pulls the
 latest published image through Docker Compose after GigaAM is ready; it does not build an image
-locally. By default, Compose uses `ghcr.io/akolotov/vorec-telegram-bot:latest`; set
-`VOREC_BOT_IMAGE` in the shell or `.env` to run a specific published tag instead.
+locally. By default, Compose uses `ghcr.io/akolotov/vorec-telegram-bot:latest` and pulls it on
+each start. Set `VOREC_BOT_IMAGE` in the shell or `.env` to run a specific published tag instead.
+To run a local build, use `VOREC_BOT_IMAGE=vorec-telegram-bot:local` and
+`VOREC_BOT_PULL_POLICY=never`.
 
 ## First setup
 
-In a new project directory, create the local Python environment and install the macOS dependencies:
+In a new project directory, create the local Python 3.12 environment and install the macOS
+dependencies:
 
 ```sh
-python3 -m venv .venv
+python3.12 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 cp .env.example .env
 ```
@@ -118,6 +123,18 @@ settings. For a second deployment, use a different `TELEGRAM_BOT_TOKEN`,
 can use the same healthy GigaAM process; configure the same `GIGAAM_URL`, `GIGAAM_API_KEY`, and
 `GIGAAM_PORT` in both. Set `GIGAAM_MANAGER_SCRIPT` in a secondary deployment to the absolute path
 of the checkout that owns that process.
+
+## Persistent data
+
+Docker Compose bind-mounts `./data` from the directory containing `docker-compose.yml` to
+`/app/data` in the bot container. Each message is saved under its timestamp (`YYYY-MM-DD_HH-MM-SS`):
+
+- `data/voices/YYYY-MM/<timestamp>.<extension>` contains the downloaded audio.
+- `data/transcripts/YYYY-MM/<timestamp>/` contains the `whisper`, `gigaam`, and `merged`
+  responses in both `.json` and `.txt` formats.
+
+The intermediate converted WAV is deleted after processing. The `data/` directory is intentionally
+excluded from Git.
 
 `manage.sh` does not install dependencies. It checks the local GigaAM health endpoint first. Only
 the GigaAM manager checks for `.venv`, tmux, and the model directory when it needs to start a new
@@ -139,7 +156,7 @@ Use one script to manage both services:
 
 `start` checks the shared GigaAM health endpoint. It reuses a healthy process or starts GigaAM in
 a detached tmux session, then starts the bot with Docker Compose and registers the Telegram
-webhook. The Compose service has `pull_policy: always`, so it checks for a new published image on
-every start without building one locally. `stop` stops only this bot and leaves shared GigaAM
-running. `stop all` stops this bot and then stops the shared GigaAM process; use it only when no
-other deployment needs GigaAM.
+webhook. By default, the Compose service has `pull_policy: always`, so it checks for a new
+published image on every start without building one locally. `stop` stops only this bot and leaves
+shared GigaAM running. `stop all` stops this bot and then stops the shared GigaAM process; use it
+only when no other deployment needs GigaAM.

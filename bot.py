@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
 import logging
 import os
 import shutil
 import subprocess
-import tempfile
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -37,6 +37,7 @@ DEFAULT_CONVERTER = "ffmpeg"
 UNSUPPORTED_MESSAGE_TEXT = "This message type is not supported. Please send audio."
 DEFAULT_WEBHOOK_LISTEN = "0.0.0.0"
 DEFAULT_WEBHOOK_PORT = 8080
+DATA_DIRECTORY = Path("data")
 
 LOGGER = logging.getLogger(__name__)
 
@@ -155,9 +156,10 @@ def transcribe_recording(
     primary_transcription_model: str,
     merge_model: str,
     converter: str,
+    artifacts_directory: Path | None = None,
 ) -> str:
     """Run both ASR engines and consolidate their results into one transcript."""
-    wav_path = source.parent / "prepared.wav"
+    wav_path = source.with_name(f"{source.stem}.prepared.wav")
     pipeline_started = time.monotonic()
     try:
         try:
@@ -177,6 +179,10 @@ def transcribe_recording(
             primary_text = primary_result.get("text")
             if not isinstance(primary_text, str) or not primary_text.strip():
                 raise ValueError("the service returned empty text")
+            if artifacts_directory is not None:
+                save_transcription_artifact(
+                    artifacts_directory, "whisper", primary_result, primary_text
+                )
             LOGGER.info("Primary transcription completed in %.1f s.", time.monotonic() - stage_started)
         except (OpenAIError, OSError, ValueError) as error:
             raise TranscriptionError(f"The primary provider could not transcribe the audio: {error}") from error
@@ -188,6 +194,10 @@ def transcribe_recording(
             gigaam_text = gigaam_result.get("text")
             if not isinstance(gigaam_text, str) or not gigaam_text.strip():
                 raise ValueError("the service returned empty text")
+            if artifacts_directory is not None:
+                save_transcription_artifact(
+                    artifacts_directory, "gigaam", gigaam_result, gigaam_text
+                )
             LOGGER.info("GigaAM transcription completed in %.1f s.", time.monotonic() - stage_started)
         except (OpenAIError, OSError, ValueError) as error:
             raise TranscriptionError(f"GigaAM could not transcribe the audio: {error}") from error
@@ -195,9 +205,13 @@ def transcribe_recording(
         try:
             stage_started = time.monotonic()
             LOGGER.info("Starting transcript merge through the inference provider.")
-            _, merged_text = merge_transcripts(
+            merged_result, merged_text = merge_transcripts(
                 primary_text, gigaam_text, inference_client, merge_model
             )
+            if artifacts_directory is not None:
+                save_transcription_artifact(
+                    artifacts_directory, "merged", merged_result, merged_text
+                )
             LOGGER.info("Transcript merge completed in %.1f s.", time.monotonic() - stage_started)
         except (OpenAIError, KeyError, OSError, ValueError) as error:
             raise TranscriptionError(f"The transcripts could not be merged: {error}") from error
@@ -229,6 +243,25 @@ def attachment_suffix(message) -> str:
     }.get(mime_type, ".ogg")
 
 
+def recording_paths(message, data_directory: Path = DATA_DIRECTORY) -> tuple[Path, Path]:
+    """Return persistent audio and transcript paths for a Telegram message."""
+    timestamp = message.date.strftime("%Y-%m-%d_%H-%M-%S")
+    month = message.date.strftime("%Y-%m")
+    source = data_directory / "voices" / month / f"{timestamp}{attachment_suffix(message)}"
+    return source, data_directory / "transcripts" / month / timestamp
+
+
+def save_transcription_artifact(
+    artifacts_directory: Path, name: str, response: dict, text: str
+) -> None:
+    """Persist one engine's complete response and extracted transcript."""
+    artifacts_directory.mkdir(parents=True, exist_ok=True)
+    (artifacts_directory / f"{name}.json").write_text(
+        json.dumps(response, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    (artifacts_directory / f"{name}.txt").write_text(text.strip() + "\n", encoding="utf-8")
+
+
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     user = update.effective_user
@@ -241,27 +274,28 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     try:
-        with tempfile.TemporaryDirectory(prefix="vorec-") as temporary_directory:
-            source = Path(temporary_directory) / f"audio{attachment_suffix(message)}"
-            try:
-                LOGGER.info("Downloading Telegram audio.")
-                telegram_file = await attachment.get_file()
-                await telegram_file.download_to_drive(custom_path=source)
-                LOGGER.info("Downloaded Telegram audio (%d bytes).", source.stat().st_size)
-            except Exception as error:
-                raise TranscriptionError(f"The audio could not be downloaded: {error}") from error
+        source, artifacts_directory = recording_paths(message)
+        source.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            LOGGER.info("Downloading Telegram audio.")
+            telegram_file = await attachment.get_file()
+            await telegram_file.download_to_drive(custom_path=source)
+            LOGGER.info("Downloaded Telegram audio (%d bytes).", source.stat().st_size)
+        except Exception as error:
+            raise TranscriptionError(f"The audio could not be downloaded: {error}") from error
 
-            async with context.application.bot_data["transcription_lock"]:
-                # MLX models and their streams must be used from the thread that loaded them.
-                transcript = transcribe_recording(
-                    source,
-                    context.application.bot_data["gigaam_client"],
-                    context.application.bot_data["gigaam_model"],
-                    context.application.bot_data["inference_client"],
-                    context.application.bot_data["primary_transcription_model"],
-                    context.application.bot_data["merge_model"],
-                    context.application.bot_data["converter"],
-                )
+        async with context.application.bot_data["transcription_lock"]:
+            # MLX models and their streams must be used from the thread that loaded them.
+            transcript = transcribe_recording(
+                source,
+                context.application.bot_data["gigaam_client"],
+                context.application.bot_data["gigaam_model"],
+                context.application.bot_data["inference_client"],
+                context.application.bot_data["primary_transcription_model"],
+                context.application.bot_data["merge_model"],
+                context.application.bot_data["converter"],
+                artifacts_directory,
+            )
 
         await send_rich_transcript_reply(message, context.bot, transcript)
     except Exception as error:
