@@ -27,5 +27,7 @@ ln -sf "$FFMPEG_PATH" "$PROJECT_DIR/.venv/bin/ffmpeg"
 export PATH="$PROJECT_DIR/.venv/bin:$PATH"
 export GIGAAM_STT_API_KEY="$GIGAAM_API_KEY"
 
+# Docker containers reach this host service through host.docker.internal, so it
+# must listen beyond the host loopback interface.
 exec "$GIGAAM_COMMAND" serve --host 0.0.0.0 --port "$GIGAAM_PORT" --variant "$GIGAAM_VARIANT" \
     --model "$GIGAAM_MODEL_PATH"
