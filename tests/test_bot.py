@@ -1,6 +1,7 @@
 import asyncio
 import os
 import unittest
+from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, Mock, patch
@@ -11,6 +12,7 @@ from bot import (
     UNSUPPORTED_MESSAGE_TEXT,
     allowed_user_ids,
     handle_unsupported_message,
+    recording_paths,
     send_rich_transcript_reply,
     transcript_chunks,
     transcribe_recording,
@@ -30,6 +32,27 @@ class AllowedUserIdsTests(unittest.TestCase):
     def test_rejects_empty_list(self) -> None:
         with self.assertRaisesRegex(ConfigurationError, "at least one user ID"):
             allowed_user_ids(" , ")
+
+
+class PersistentStorageTests(unittest.TestCase):
+    def test_recording_paths_match_persistent_directory_layout(self) -> None:
+        attachment = Mock(file_name="memo.m4a")
+        message = Mock(
+            date=datetime(2026, 8, 22, 10, 0, 40),
+            voice=attachment,
+            audio=None,
+            document=None,
+        )
+
+        audio_path, transcript_directory = recording_paths(message, Path("persistent-data"))
+
+        self.assertEqual(
+            audio_path, Path("persistent-data/voices/2026-08/2026-08-22_10-00-40.m4a")
+        )
+        self.assertEqual(
+            transcript_directory,
+            Path("persistent-data/transcripts/2026-08/2026-08-22_10-00-40"),
+        )
 
 
 class WebhookConfigurationTests(unittest.TestCase):
@@ -147,10 +170,10 @@ class UnsupportedMessageTests(unittest.TestCase):
 
 
 class TranscribeRecordingTests(unittest.TestCase):
-    @patch("bot.merge_transcripts", return_value=({}, " merged text "))
+    @patch("bot.merge_transcripts", return_value=({"text": "merged text"}, " merged text "))
     @patch(
         "bot.whisper_transcribe",
-        side_effect=[{"text": "gigaam text"}, {"text": "whisper text"}],
+        side_effect=[{"text": "whisper text"}, {"text": "gigaam text"}],
     )
     @patch("bot.prepare_wav")
     def test_runs_both_engines_and_returns_merged_text(
@@ -158,6 +181,7 @@ class TranscribeRecordingTests(unittest.TestCase):
     ) -> None:
         with TemporaryDirectory() as directory:
             source = Path(directory) / "audio.ogg"
+            artifacts_directory = Path(directory) / "transcripts"
             source.touch()
             result = transcribe_recording(
                 source,
@@ -167,7 +191,14 @@ class TranscribeRecordingTests(unittest.TestCase):
                 "whisper-model",
                 "merge-model",
                 "afconvert",
+                artifacts_directory,
             )
+
+            self.assertEqual(
+                {path.name for path in artifacts_directory.iterdir()},
+                {"whisper.json", "whisper.txt", "gigaam.json", "gigaam.txt", "merged.json", "merged.txt"},
+            )
+            self.assertEqual((artifacts_directory / "merged.txt").read_text(), "merged text\n")
 
         self.assertEqual(result, "merged text")
         prepare_wav.assert_called_once()
