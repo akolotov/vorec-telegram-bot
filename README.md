@@ -49,30 +49,36 @@ Telegram → Tailscale Funnel → tailscale-ingress → bot container → GigaAM
 
 All configuration, including API URLs and tokens, is in `.env`. Start by copying `.env.example`.
 
-## Webhook through Tailscale
+## Webhook through Tailscale Funnel
 
-The bot receives Telegram updates through the shared `tailscale-ingress` Docker network;
-it does not publish a host port. The external gateway routes
-`/hooks/<Docker network alias>/...` to port 8080 of that container.
+The shared Tailscale gateway on this machine already exposes the generic
+`/hooks/<docker-alias>/...` route. The Compose service reads its network alias
+from `WEBHOOK_DOCKER_ALIAS`; it must match the `<docker-alias>` segment in
+`WEBHOOK_PATH`.
 
-This project depends on an existing Tailscale Funnel gateway. Before starting the bot, deploy and
-configure [tailscale-funnel-gateway](https://github.com/akolotov/tailscale-funnel-gateway). That
-project creates the `tailscale-ingress` Docker network and exposes the shared Funnel hostname used
-by `WEBHOOK_PUBLIC_BASE_URL`.
+This deployment depends on the shared
+[tailscale-funnel-gateway](https://github.com/akolotov/tailscale-funnel-gateway).
+Deploy that gateway first: it creates the external `tailscale-ingress` Docker
+network and publishes the Funnel hostname used by `WEBHOOK_PUBLIC_BASE_URL`.
 
-The Compose service uses the alias `vorec-telegram-bot`. Configure the following values
-in `.env` (the Funnel host should match the shared gateway):
+Set the matching values in `.env` before deployment. `WEBHOOK_SECRET_TOKEN`
+must be a new random 1-256 character value using only letters, digits,
+underscores, and hyphens; it is sent to Telegram during `setWebhook` and the
+receiver rejects requests that do not include it.
 
-```dotenv
-WEBHOOK_PUBLIC_BASE_URL=https://wabelfish-funnel.taild8e94b.ts.net
-WEBHOOK_DOCKER_ALIAS=vorec-telegram-bot
-WEBHOOK_PATH=/hooks/vorec-telegram-bot/telegram/webhook
-WEBHOOK_SECRET_TOKEN=replace_with_a_long_random_webhook_secret
+Generate a suitable secret with the project's virtualenv, then copy its output
+to `WEBHOOK_SECRET_TOKEN`:
+
+```sh
+.venv/bin/python -c 'import secrets; print(secrets.token_urlsafe(32))'
 ```
 
-`WEBHOOK_SECRET_TOKEN` is sent by Telegram in a request header and is checked by the bot.
-`WEBHOOK_DOCKER_ALIAS` must match the `<Docker network alias>` portion of `WEBHOOK_PATH`.
-The external `tailscale-ingress` Docker network must already exist before running `manage.sh`.
+```dotenv
+WEBHOOK_PUBLIC_BASE_URL=https://<funnel-hostname>.<tailnet>.ts.net
+WEBHOOK_DOCKER_ALIAS=<docker-alias>
+WEBHOOK_PATH=/hooks/<docker-alias>/<webhook-endpoint>
+WEBHOOK_SECRET_TOKEN=<new-random-secret>
+```
 
 Each deployment must also set a unique `COMPOSE_PROJECT_NAME`. Docker Compose uses this name to
 keep containers from different checkouts separate. A second deployment needs a different
