@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import TypeVar
 from urllib.parse import urlparse
 
+import httpx
 from dotenv import load_dotenv
 from openai import OpenAI, OpenAIError
 from telegram import Update
@@ -50,6 +51,7 @@ DELIVERY_FAILED_TEXT = "The transcript was created, but it could not be delivere
 DELIVERY_UNCONFIRMED_TEXT = (
     "The transcript was created, but its delivery could not be confirmed."
 )
+DELIVERY_RETRY_DELAYS = (1, 2)
 DEFAULT_WEBHOOK_LISTEN = "0.0.0.0"
 DEFAULT_WEBHOOK_PORT = 8080
 DATA_DIRECTORY = Path("data")
@@ -172,7 +174,41 @@ async def edit_italic_status(status_message, text: str) -> bool:
 
 def delivery_outcome_is_uncertain(error: Exception) -> bool:
     """Return whether a failed request may still have reached Telegram."""
-    return isinstance(error, (TimedOut, NetworkError)) and not isinstance(error, BadRequest)
+    return (
+        isinstance(error, (TimedOut, NetworkError))
+        and not isinstance(error, BadRequest)
+        and not delivery_request_was_not_sent(error)
+    )
+
+
+def delivery_request_was_not_sent(error: Exception) -> bool:
+    """Return whether HTTPX confirms that Telegram never received the request."""
+    return isinstance(
+        error.__cause__,
+        (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout),
+    )
+
+
+async def retry_delivery_request(operation: Callable[[], Awaitable[T]]) -> T:
+    """Retry a Telegram delivery request only when it was definitely not sent."""
+    for attempt, delay in enumerate((*DELIVERY_RETRY_DELAYS, None), start=1):
+        try:
+            return await operation()
+        except Exception as error:
+            if delay is None or not delivery_request_was_not_sent(error):
+                raise
+            cause = error.__cause__
+            LOGGER.warning(
+                "Telegram delivery request failed before sending (%s); "
+                "retrying in %d s (attempt %d/%d).",
+                cause.__class__.__name__,
+                delay,
+                attempt + 1,
+                len(DELIVERY_RETRY_DELAYS) + 1,
+            )
+            await asyncio.sleep(delay)
+
+    raise AssertionError("delivery retry loop exited unexpectedly")
 
 
 async def report_delivery_failure(message, status_message, *, uncertain: bool) -> None:
@@ -196,7 +232,9 @@ async def deliver_transcript(message, status_message, bot, transcript: str) -> N
     """Deliver a completed transcript without reporting delivery as processing failure."""
     if status_message is None:
         try:
-            await send_rich_transcript_reply(message, bot, transcript)
+            await retry_delivery_request(
+                lambda: send_rich_transcript_reply(message, bot, transcript)
+            )
         except Exception as error:
             LOGGER.exception("Rich Message transcript delivery failed.")
             await report_delivery_failure(
@@ -207,7 +245,9 @@ async def deliver_transcript(message, status_message, bot, transcript: str) -> N
         return
 
     try:
-        await edit_rich_transcript_message(status_message, bot, transcript)
+        await retry_delivery_request(
+            lambda: edit_rich_transcript_message(status_message, bot, transcript)
+        )
         return
     except Exception as error:
         LOGGER.exception("Could not replace status with the Rich Message transcript.")
@@ -215,7 +255,9 @@ async def deliver_transcript(message, status_message, bot, transcript: str) -> N
             return
 
     try:
-        await send_rich_transcript_reply(message, bot, transcript)
+        await retry_delivery_request(
+            lambda: send_rich_transcript_reply(message, bot, transcript)
+        )
     except Exception as fallback_error:
         LOGGER.exception("Fallback Rich Message transcript delivery failed.")
         await report_delivery_failure(
@@ -399,8 +441,9 @@ def recording_paths(message, data_directory: Path = DATA_DIRECTORY) -> tuple[Pat
     """Return persistent audio and transcript paths for a Telegram message."""
     timestamp = message.date.strftime("%Y-%m-%d_%H-%M-%S")
     month = message.date.strftime("%Y-%m")
-    source = data_directory / "voices" / month / f"{timestamp}{attachment_suffix(message)}"
-    return source, data_directory / "transcripts" / month / timestamp
+    recording_id = f"{timestamp}_{message.chat_id}_{message.message_id}"
+    source = data_directory / "voices" / month / f"{recording_id}{attachment_suffix(message)}"
+    return source, data_directory / "transcripts" / month / recording_id
 
 
 def save_transcription_artifact(
@@ -450,20 +493,18 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             if status_message is not None:
                 await edit_italic_status(status_message, text)
 
-        async with context.application.bot_data["transcription_lock"]:
-            # Keep end-to-end handling sequential until concurrent updates are enabled.
-            transcript = await transcribe_recording(
-                source,
-                context.application.bot_data["gigaam_client"],
-                context.application.bot_data["gigaam_model"],
-                context.application.bot_data["inference_client"],
-                context.application.bot_data["primary_transcription_model"],
-                context.application.bot_data["merge_model"],
-                context.application.bot_data["converter"],
-                context.application.bot_data["stage_locks"],
-                artifacts_directory,
-                report_progress,
-            )
+        transcript = await transcribe_recording(
+            source,
+            context.application.bot_data["gigaam_client"],
+            context.application.bot_data["gigaam_model"],
+            context.application.bot_data["inference_client"],
+            context.application.bot_data["primary_transcription_model"],
+            context.application.bot_data["merge_model"],
+            context.application.bot_data["converter"],
+            context.application.bot_data["stage_locks"],
+            artifacts_directory,
+            report_progress,
+        )
     except Exception as error:
         LOGGER.exception("Failed to process audio from Telegram user %s", user.id)
         reason = (
@@ -543,10 +584,9 @@ def main() -> None:
     )
 
     audio_messages = filters.VOICE | filters.AUDIO | filters.Document.Category("audio/")
-    app = ApplicationBuilder().token(token).build()
+    app = ApplicationBuilder().token(token).concurrent_updates(True).build()
     app.bot_data.update(
         allowed_user_ids=user_ids,
-        transcription_lock=asyncio.Lock(),
         stage_locks=StageLocks(),
         gigaam_client=gigaam_client,
         gigaam_model=gigaam_model,
