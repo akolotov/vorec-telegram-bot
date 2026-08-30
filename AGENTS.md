@@ -14,6 +14,10 @@ Never expose private data from environment files in the context window, whether 
 
 Apply YAGNI and KISS: implement only what is needed, using the simplest clear solution.
 
+# GitHub CLI
+
+Run `gh` commands outside the sandbox.
+
 # Local Bot Runtime
 
 For local end-to-end tests, run `./scripts/manage.sh start` from the project root outside the sandbox. It reuses healthy shared GigaAM or starts it, then starts the Docker Compose bot with the current `.env`, including webhook registration.
