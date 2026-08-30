@@ -127,14 +127,16 @@ of the checkout that owns that process.
 ## Persistent data
 
 Docker Compose bind-mounts `./data` from the directory containing `docker-compose.yml` to
-`/app/data` in the bot container. Each message is saved under its timestamp (`YYYY-MM-DD_HH-MM-SS`):
+`/app/data` in the bot container. Each message is saved under its timestamp, chat ID, and Telegram
+message ID (`YYYY-MM-DD_HH-MM-SS_<chat-id>_<message-id>`):
 
-- `data/voices/YYYY-MM/<timestamp>.<extension>` contains the downloaded audio.
-- `data/transcripts/YYYY-MM/<timestamp>/` contains the `whisper`, `gigaam`, and `merged`
+- `data/voices/YYYY-MM/<recording-id>.<extension>` contains the downloaded audio.
+- `data/transcripts/YYYY-MM/<recording-id>/` contains the `whisper`, `gigaam`, and `merged`
   responses in both `.json` and `.txt` formats.
 
 The intermediate converted WAV is deleted after processing. The `data/` directory is intentionally
-excluded from Git.
+excluded from Git. Incoming messages are handled concurrently, while the bot serializes each
+ffmpeg, GigaAM, and oMLX stage and reports when a recording is waiting for one of them.
 
 `manage.sh` does not install dependencies. It checks the local GigaAM health endpoint first. Only
 the GigaAM manager checks for `.venv`, tmux, and the model directory when it needs to start a new

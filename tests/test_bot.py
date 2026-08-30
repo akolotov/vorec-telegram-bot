@@ -7,6 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, Mock, patch
 
+import httpx
 from bot import (
     ConfigurationError,
     DELIVERY_FAILED_TEXT,
@@ -26,13 +27,14 @@ from bot import (
     edit_rich_transcript_message,
     handle_audio,
     handle_unsupported_message,
+    main,
     recording_paths,
     run_serial_stage,
     send_rich_transcript_reply,
     transcribe_recording,
     webhook_configuration,
 )
-from telegram.error import BadRequest, TimedOut
+from telegram.error import BadRequest, NetworkError, TimedOut
 from vorec.audio import prepare_wav, resolve_converter
 
 
@@ -54,6 +56,8 @@ class PersistentStorageTests(unittest.TestCase):
         attachment = Mock(file_name="memo.m4a")
         message = Mock(
             date=datetime(2026, 8, 22, 10, 0, 40),
+            chat_id=123,
+            message_id=456,
             voice=attachment,
             audio=None,
             document=None,
@@ -62,11 +66,68 @@ class PersistentStorageTests(unittest.TestCase):
         audio_path, transcript_directory = recording_paths(message, Path("persistent-data"))
 
         self.assertEqual(
-            audio_path, Path("persistent-data/voices/2026-08/2026-08-22_10-00-40.m4a")
+            audio_path,
+            Path("persistent-data/voices/2026-08/2026-08-22_10-00-40_123_456.m4a"),
         )
         self.assertEqual(
             transcript_directory,
-            Path("persistent-data/transcripts/2026-08/2026-08-22_10-00-40"),
+            Path("persistent-data/transcripts/2026-08/2026-08-22_10-00-40_123_456"),
+        )
+
+    def test_recording_paths_include_chat_id_to_avoid_cross_chat_collisions(self) -> None:
+        attachment = Mock(file_name="memo.m4a")
+        first_message = Mock(
+            date=datetime(2026, 8, 22, 10, 0, 40),
+            chat_id=123,
+            message_id=456,
+            voice=attachment,
+            audio=None,
+            document=None,
+        )
+        second_message = Mock(
+            date=datetime(2026, 8, 22, 10, 0, 40),
+            chat_id=-100987,
+            message_id=456,
+            voice=attachment,
+            audio=None,
+            document=None,
+        )
+
+        first_paths = recording_paths(first_message, Path("persistent-data"))
+        second_paths = recording_paths(second_message, Path("persistent-data"))
+
+        self.assertNotEqual(first_paths, second_paths)
+        self.assertEqual(
+            second_paths[0],
+            Path("persistent-data/voices/2026-08/2026-08-22_10-00-40_-100987_456.m4a"),
+        )
+
+    def test_recording_paths_include_message_id_to_avoid_same_chat_collisions(self) -> None:
+        attachment = Mock(file_name="memo.m4a")
+        first_message = Mock(
+            date=datetime(2026, 8, 22, 10, 0, 40),
+            chat_id=123,
+            message_id=456,
+            voice=attachment,
+            audio=None,
+            document=None,
+        )
+        second_message = Mock(
+            date=datetime(2026, 8, 22, 10, 0, 40),
+            chat_id=123,
+            message_id=457,
+            voice=attachment,
+            audio=None,
+            document=None,
+        )
+
+        first_paths = recording_paths(first_message, Path("persistent-data"))
+        second_paths = recording_paths(second_message, Path("persistent-data"))
+
+        self.assertNotEqual(first_paths, second_paths)
+        self.assertEqual(
+            second_paths[1],
+            Path("persistent-data/transcripts/2026-08/2026-08-22_10-00-40_123_457"),
         )
 
 
@@ -148,6 +209,11 @@ class RichMessageTests(unittest.TestCase):
 
 
 class TranscriptDeliveryTests(unittest.TestCase):
+    @staticmethod
+    def telegram_error(error, cause):
+        error.__cause__ = cause
+        return error
+
     def test_sends_reply_when_status_was_not_created(self) -> None:
         message = Mock(chat_id=123, message_id=456, message_thread_id=None)
         bot = Mock(_post=AsyncMock())
@@ -217,6 +283,120 @@ class TranscriptDeliveryTests(unittest.TestCase):
         bot._post.assert_awaited_once()
         status.edit_text.assert_not_awaited()
 
+    def test_connect_error_retries_edit_until_success(self) -> None:
+        message = Mock(chat_id=123, message_id=456, message_thread_id=None)
+        status = Mock(chat_id=123, message_id=789)
+        status.edit_text = AsyncMock()
+        bot = Mock()
+        bot._post = AsyncMock(
+            side_effect=[
+                self.telegram_error(
+                    NetworkError("connect failed"), httpx.ConnectError("offline")
+                ),
+                self.telegram_error(
+                    NetworkError("connect failed"), httpx.ConnectError("offline")
+                ),
+                True,
+            ]
+        )
+
+        with patch("bot.asyncio.sleep", new_callable=AsyncMock) as sleep:
+            asyncio.run(deliver_transcript(message, status, bot, "final text"))
+
+        self.assertEqual(bot._post.await_count, 3)
+        self.assertEqual(
+            [call.args[0] for call in bot._post.await_args_list],
+            ["editMessageText", "editMessageText", "editMessageText"],
+        )
+        self.assertEqual([call.args[0] for call in sleep.await_args_list], [1, 2])
+        status.edit_text.assert_not_awaited()
+
+    def test_exhausted_connect_error_retries_use_fallback_reply(self) -> None:
+        message = Mock(chat_id=123, message_id=456, message_thread_id=None)
+        status = Mock(chat_id=123, message_id=789)
+        status.edit_text = AsyncMock()
+        connect_errors = [
+            self.telegram_error(
+                NetworkError("connect failed"), httpx.ConnectError("offline")
+            )
+            for _ in range(3)
+        ]
+        bot = Mock(_post=AsyncMock(side_effect=[*connect_errors, True]))
+
+        with patch("bot.asyncio.sleep", new_callable=AsyncMock):
+            asyncio.run(deliver_transcript(message, status, bot, "final text"))
+
+        self.assertEqual(bot._post.await_count, 4)
+        self.assertEqual(
+            [call.args[0] for call in bot._post.await_args_list],
+            ["editMessageText", "editMessageText", "editMessageText", "sendRichMessage"],
+        )
+        status.edit_text.assert_awaited_once_with(
+            "<i>Transcription complete. The result is in the next message.</i>",
+            parse_mode="HTML",
+        )
+
+    def test_connect_error_retries_reply_when_status_was_not_created(self) -> None:
+        message = Mock(chat_id=123, message_id=456, message_thread_id=None)
+        message.reply_text = AsyncMock()
+        bot = Mock(
+            _post=AsyncMock(
+                side_effect=[
+                    self.telegram_error(
+                        NetworkError("connect failed"), httpx.ConnectError("offline")
+                    ),
+                    True,
+                ]
+            )
+        )
+
+        with patch("bot.asyncio.sleep", new_callable=AsyncMock) as sleep:
+            asyncio.run(deliver_transcript(message, None, bot, "final text"))
+
+        self.assertEqual(bot._post.await_count, 2)
+        self.assertEqual(
+            [call.args[0] for call in bot._post.await_args_list],
+            ["sendRichMessage", "sendRichMessage"],
+        )
+        sleep.assert_awaited_once_with(1)
+        message.reply_text.assert_not_awaited()
+
+    def test_connect_and_pool_timeouts_are_retried(self) -> None:
+        causes = [httpx.ConnectTimeout("offline"), httpx.PoolTimeout("pool full")]
+        for cause in causes:
+            with self.subTest(cause=cause.__class__.__name__):
+                message = Mock(chat_id=123, message_id=456, message_thread_id=None)
+                message.reply_text = AsyncMock()
+                bot = Mock(
+                    _post=AsyncMock(
+                        side_effect=[
+                            self.telegram_error(TimedOut("not sent"), cause),
+                            True,
+                        ]
+                    )
+                )
+
+                with patch("bot.asyncio.sleep", new_callable=AsyncMock) as sleep:
+                    asyncio.run(deliver_transcript(message, None, bot, "final text"))
+
+                self.assertEqual(bot._post.await_count, 2)
+                sleep.assert_awaited_once_with(1)
+                message.reply_text.assert_not_awaited()
+
+    def test_read_error_is_not_retried(self) -> None:
+        message = Mock(chat_id=123, message_id=456, message_thread_id=None)
+        status = Mock(chat_id=123, message_id=789)
+        status.edit_text = AsyncMock()
+        error = self.telegram_error(
+            NetworkError("read failed"), httpx.ReadError("unknown outcome")
+        )
+        bot = Mock(_post=AsyncMock(side_effect=error))
+
+        asyncio.run(deliver_transcript(message, status, bot, "final text"))
+
+        bot._post.assert_awaited_once()
+        status.edit_text.assert_not_awaited()
+
     def test_uncertain_fallback_is_not_retried(self) -> None:
         message = Mock(chat_id=123, message_id=456, message_thread_id=None)
         status = Mock(chat_id=123, message_id=789)
@@ -260,7 +440,6 @@ class HandleAudioTests(unittest.TestCase):
         context = Mock(bot=bot)
         context.application.bot_data = {
             "allowed_user_ids": {123},
-            "transcription_lock": asyncio.Lock(),
             "stage_locks": StageLocks(),
             "gigaam_client": Mock(),
             "gigaam_model": "gigaam-model",
@@ -389,6 +568,87 @@ class HandleAudioTests(unittest.TestCase):
         self.assertEqual(status.edit_text.await_count, 4)
         bot._post.assert_awaited_once()
         self.assertEqual(bot._post.await_args.args[0], "editMessageText")
+
+    @patch("bot.transcribe_recording")
+    @patch("bot.recording_paths")
+    def test_multiple_recordings_reach_transcription_concurrently(
+        self, recording_paths, transcribe_recording
+    ) -> None:
+        async def scenario() -> None:
+            with TemporaryDirectory() as directory:
+                first_source = Path(directory) / "first.ogg"
+                second_source = Path(directory) / "second.ogg"
+                first_status = Mock(chat_id=123, message_id=789)
+                first_status.edit_text = AsyncMock()
+                second_status = Mock(chat_id=123, message_id=790)
+                second_status.edit_text = AsyncMock()
+                first_update, first_context, _, _, first_artifacts = self.audio_request(
+                    first_source, first_status
+                )
+                second_update, second_context, _, _, second_artifacts = self.audio_request(
+                    second_source, second_status
+                )
+                second_context.application.bot_data = first_context.application.bot_data
+                recording_paths.side_effect = [
+                    (first_source, first_artifacts),
+                    (second_source, second_artifacts),
+                ]
+
+                first_started = asyncio.Event()
+                second_started = asyncio.Event()
+                release = asyncio.Event()
+
+                async def transcribe(*args):
+                    if not first_started.is_set():
+                        first_started.set()
+                    else:
+                        second_started.set()
+                    await release.wait()
+                    return "final text"
+
+                transcribe_recording.side_effect = transcribe
+                first_task = asyncio.create_task(handle_audio(first_update, first_context))
+                await first_started.wait()
+                second_task = asyncio.create_task(handle_audio(second_update, second_context))
+                try:
+                    await asyncio.wait_for(second_started.wait(), timeout=1)
+                finally:
+                    release.set()
+                await asyncio.gather(first_task, second_task)
+
+        asyncio.run(scenario())
+        self.assertEqual(transcribe_recording.await_count, 2)
+
+
+class ApplicationConfigurationTests(unittest.TestCase):
+    @patch("bot.shutil.which", return_value="/usr/bin/ffmpeg")
+    @patch("bot.resolve_converter", return_value="ffmpeg")
+    @patch("bot.load_dotenv")
+    @patch("bot.OpenAI")
+    @patch("bot.ApplicationBuilder")
+    def test_enables_concurrent_updates(
+        self, application_builder, openai, load_dotenv, resolve_converter, which
+    ) -> None:
+        application = Mock()
+        builder = application_builder.return_value
+        builder.token.return_value.concurrent_updates.return_value.build.return_value = application
+        openai.return_value.models.retrieve.return_value = Mock()
+        environment = {
+            "TELEGRAM_BOT_TOKEN": "token",
+            "ALLOWED_USER_IDS": "123",
+            "WEBHOOK_PUBLIC_BASE_URL": "https://funnel.example.ts.net",
+            "WEBHOOK_PATH": "/hooks/bot/telegram/webhook",
+            "WEBHOOK_SECRET_TOKEN": "secret-token",
+            "GIGAAM_URL": "http://gigaam.example.test",
+            "GIGAAM_API_KEY": "gigaam-key",
+            "INFERENCE_API_URL": "https://inference.example.test",
+            "INFERENCE_API_KEY": "inference-key",
+        }
+        with patch.dict(os.environ, environment, clear=False):
+            main()
+
+        builder.token.return_value.concurrent_updates.assert_called_once_with(True)
+        application.run_webhook.assert_called_once()
 
 
 class UnsupportedMessageTests(unittest.TestCase):
