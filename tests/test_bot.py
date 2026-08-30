@@ -605,10 +605,11 @@ class StageLockTests(unittest.TestCase):
                     merge,
                 )
             )
-            await asyncio.sleep(0)
-            self.assertEqual(order, ["whisper-start"])
-
-            release_first.set()
+            try:
+                await asyncio.sleep(0)
+                self.assertEqual(order, ["whisper-start"])
+            finally:
+                release_first.set()
             self.assertEqual(await whisper_task, "whisper")
             self.assertEqual(await merge_task, "merge")
             self.assertEqual(
@@ -649,11 +650,13 @@ class StageLockTests(unittest.TestCase):
                 )
             )
 
-            await asyncio.wait_for(
-                asyncio.gather(started["wav"].wait(), started["gigaam"].wait()),
-                timeout=1,
-            )
-            release.set()
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(started["wav"].wait(), started["gigaam"].wait()),
+                    timeout=1,
+                )
+            finally:
+                release.set()
             self.assertEqual(await wav_task, "wav")
             self.assertEqual(await gigaam_task, "gigaam")
 
@@ -696,10 +699,11 @@ class StageLockTests(unittest.TestCase):
                     second,
                 )
             )
-            await asyncio.sleep(0)
-            self.assertEqual(order, ["first-start"])
-
-            release_first.set()
+            try:
+                await asyncio.sleep(0)
+                self.assertEqual(order, ["first-start"])
+            finally:
+                release_first.set()
             with self.assertRaises(asyncio.CancelledError):
                 await first_task
             self.assertEqual(await second_task, "second")
