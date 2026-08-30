@@ -1,5 +1,6 @@
 import asyncio
 import os
+import threading
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -14,14 +15,19 @@ from bot import (
     MERGING_STATUS,
     PREPARING_STATUS,
     SECOND_TRANSCRIPT_STATUS,
+    StageLocks,
     TranscriptionError,
     UNSUPPORTED_MESSAGE_TEXT,
+    WAITING_FOR_FIRST_TRANSCRIPT_STATUS,
+    WAITING_FOR_MERGE_STATUS,
+    WAITING_FOR_PREPARATION_STATUS,
     allowed_user_ids,
     deliver_transcript,
     edit_rich_transcript_message,
     handle_audio,
     handle_unsupported_message,
     recording_paths,
+    run_serial_stage,
     send_rich_transcript_reply,
     transcribe_recording,
     webhook_configuration,
@@ -255,6 +261,7 @@ class HandleAudioTests(unittest.TestCase):
         context.application.bot_data = {
             "allowed_user_ids": {123},
             "transcription_lock": asyncio.Lock(),
+            "stage_locks": StageLocks(),
             "gigaam_client": Mock(),
             "gigaam_model": "gigaam-model",
             "inference_client": Mock(),
@@ -440,6 +447,7 @@ class TranscribeRecordingTests(unittest.TestCase):
                     "whisper-model",
                     "merge-model",
                     "afconvert",
+                    StageLocks(),
                     artifacts_directory,
                     progress,
                 )
@@ -480,6 +488,7 @@ class TranscribeRecordingTests(unittest.TestCase):
                         "whisper-model",
                         "merge-model",
                         "afconvert",
+                        StageLocks(),
                     )
                 )
 
@@ -501,11 +510,209 @@ class TranscribeRecordingTests(unittest.TestCase):
                     "whisper-model",
                     "merge-model",
                     "afconvert",
+                    StageLocks(),
                 )
             )
 
         converted_path = prepare_wav.call_args.args[1]
         self.assertNotEqual(converted_path, source)
+
+
+class StageLockTests(unittest.TestCase):
+    def test_free_lock_reports_only_active_status(self) -> None:
+        async def scenario() -> None:
+            statuses = []
+
+            async def progress(status: str) -> None:
+                statuses.append(status)
+
+            result = await run_serial_stage(
+                asyncio.Lock(),
+                WAITING_FOR_PREPARATION_STATUS,
+                PREPARING_STATUS,
+                lambda: "done",
+                progress=progress,
+            )
+
+            self.assertEqual(result, "done")
+            self.assertEqual(statuses, [PREPARING_STATUS])
+
+        asyncio.run(scenario())
+
+    def test_busy_lock_reports_waiting_then_active_status(self) -> None:
+        async def scenario() -> None:
+            lock = asyncio.Lock()
+            statuses = []
+
+            async def progress(status: str) -> None:
+                statuses.append(status)
+
+            await lock.acquire()
+            task = asyncio.create_task(
+                run_serial_stage(
+                    lock,
+                    WAITING_FOR_PREPARATION_STATUS,
+                    PREPARING_STATUS,
+                    lambda: "done",
+                    progress=progress,
+                )
+            )
+            await asyncio.sleep(0)
+            self.assertEqual(statuses, [WAITING_FOR_PREPARATION_STATUS])
+
+            lock.release()
+            self.assertEqual(await task, "done")
+            self.assertEqual(
+                statuses,
+                [WAITING_FOR_PREPARATION_STATUS, PREPARING_STATUS],
+            )
+
+        asyncio.run(scenario())
+
+    def test_omlx_lock_serializes_whisper_and_merge(self) -> None:
+        async def scenario() -> None:
+            stage_locks = StageLocks()
+            order = []
+            first_started = asyncio.Event()
+            release_first = threading.Event()
+            loop = asyncio.get_running_loop()
+
+            def whisper() -> str:
+                order.append("whisper-start")
+                loop.call_soon_threadsafe(first_started.set)
+                release_first.wait()
+                order.append("whisper-finish")
+                return "whisper"
+
+            def merge() -> str:
+                order.append("merge-start")
+                return "merge"
+
+            whisper_task = asyncio.create_task(
+                run_serial_stage(
+                    stage_locks.omlx,
+                    WAITING_FOR_FIRST_TRANSCRIPT_STATUS,
+                    FIRST_TRANSCRIPT_STATUS,
+                    whisper,
+                )
+            )
+            await first_started.wait()
+            merge_task = asyncio.create_task(
+                run_serial_stage(
+                    stage_locks.omlx,
+                    WAITING_FOR_MERGE_STATUS,
+                    MERGING_STATUS,
+                    merge,
+                )
+            )
+            try:
+                await asyncio.sleep(0)
+                self.assertEqual(order, ["whisper-start"])
+            finally:
+                release_first.set()
+            self.assertEqual(await whisper_task, "whisper")
+            self.assertEqual(await merge_task, "merge")
+            self.assertEqual(
+                order,
+                ["whisper-start", "whisper-finish", "merge-start"],
+            )
+
+        asyncio.run(scenario())
+
+    def test_different_stage_locks_can_run_concurrently(self) -> None:
+        async def scenario() -> None:
+            stage_locks = StageLocks()
+            started = {"wav": asyncio.Event(), "gigaam": asyncio.Event()}
+            release = threading.Event()
+            loop = asyncio.get_running_loop()
+
+            def operation(name: str) -> str:
+                loop.call_soon_threadsafe(started[name].set)
+                release.wait()
+                return name
+
+            wav_task = asyncio.create_task(
+                run_serial_stage(
+                    stage_locks.wav,
+                    WAITING_FOR_PREPARATION_STATUS,
+                    PREPARING_STATUS,
+                    operation,
+                    "wav",
+                )
+            )
+            gigaam_task = asyncio.create_task(
+                run_serial_stage(
+                    stage_locks.gigaam,
+                    WAITING_FOR_PREPARATION_STATUS,
+                    SECOND_TRANSCRIPT_STATUS,
+                    operation,
+                    "gigaam",
+                )
+            )
+
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(started["wav"].wait(), started["gigaam"].wait()),
+                    timeout=1,
+                )
+            finally:
+                release.set()
+            self.assertEqual(await wav_task, "wav")
+            self.assertEqual(await gigaam_task, "gigaam")
+
+        asyncio.run(scenario())
+
+    def test_cancellation_holds_lock_until_thread_finishes(self) -> None:
+        async def scenario() -> None:
+            lock = asyncio.Lock()
+            order = []
+            first_started = asyncio.Event()
+            release_first = threading.Event()
+            loop = asyncio.get_running_loop()
+
+            def first() -> str:
+                order.append("first-start")
+                loop.call_soon_threadsafe(first_started.set)
+                release_first.wait()
+                order.append("first-finish")
+                return "first"
+
+            def second() -> str:
+                order.append("second-start")
+                return "second"
+
+            first_task = asyncio.create_task(
+                run_serial_stage(
+                    lock,
+                    WAITING_FOR_PREPARATION_STATUS,
+                    PREPARING_STATUS,
+                    first,
+                )
+            )
+            await first_started.wait()
+            first_task.cancel()
+            second_task = asyncio.create_task(
+                run_serial_stage(
+                    lock,
+                    WAITING_FOR_PREPARATION_STATUS,
+                    PREPARING_STATUS,
+                    second,
+                )
+            )
+            try:
+                await asyncio.sleep(0)
+                self.assertEqual(order, ["first-start"])
+            finally:
+                release_first.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await first_task
+            self.assertEqual(await second_task, "second")
+            self.assertEqual(
+                order,
+                ["first-start", "first-finish", "second-start"],
+            )
+
+        asyncio.run(scenario())
 
 
 class AudioConversionTests(unittest.TestCase):

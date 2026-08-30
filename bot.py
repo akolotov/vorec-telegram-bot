@@ -11,7 +11,9 @@ import shutil
 import subprocess
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TypeVar
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
@@ -40,6 +42,10 @@ PREPARING_STATUS = "Preparing audio…"
 FIRST_TRANSCRIPT_STATUS = "Creating the first transcript…"
 SECOND_TRANSCRIPT_STATUS = "Creating the second transcript…"
 MERGING_STATUS = "Merging transcripts…"
+WAITING_FOR_PREPARATION_STATUS = "Waiting to prepare audio…"
+WAITING_FOR_FIRST_TRANSCRIPT_STATUS = "Waiting to create the first transcript…"
+WAITING_FOR_SECOND_TRANSCRIPT_STATUS = "Waiting to create the second transcript…"
+WAITING_FOR_MERGE_STATUS = "Waiting to merge transcripts…"
 DELIVERY_FAILED_TEXT = "The transcript was created, but it could not be delivered."
 DELIVERY_UNCONFIRMED_TEXT = (
     "The transcript was created, but its delivery could not be confirmed."
@@ -49,6 +55,7 @@ DEFAULT_WEBHOOK_PORT = 8080
 DATA_DIRECTORY = Path("data")
 
 LOGGER = logging.getLogger(__name__)
+T = TypeVar("T")
 
 
 class ConfigurationError(ValueError):
@@ -57,6 +64,15 @@ class ConfigurationError(ValueError):
 
 class TranscriptionError(RuntimeError):
     """A transcription failure with a user-safe English explanation."""
+
+
+@dataclass
+class StageLocks:
+    """Serialize the bot's use of each blocking transcription resource."""
+
+    wav: asyncio.Lock = field(default_factory=asyncio.Lock)
+    gigaam: asyncio.Lock = field(default_factory=asyncio.Lock)
+    omlx: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 def required_env(name: str) -> str:
@@ -215,6 +231,39 @@ async def deliver_transcript(message, status_message, bot, transcript: str) -> N
     )
 
 
+async def run_serial_stage(
+    lock: asyncio.Lock,
+    waiting_status: str,
+    active_status: str,
+    operation: Callable[..., T],
+    *args: object,
+    progress: Callable[[str], Awaitable[None]] | None = None,
+) -> T:
+    """Run one blocking operation without overlapping work in the same stage."""
+    if lock.locked() and progress is not None:
+        await progress(waiting_status)
+
+    async with lock:
+        if progress is not None:
+            await progress(active_status)
+        completion = asyncio.create_task(asyncio.to_thread(operation, *args))
+        try:
+            return await asyncio.shield(completion)
+        except asyncio.CancelledError:
+            while not completion.done():
+                try:
+                    await asyncio.shield(completion)
+                except asyncio.CancelledError:
+                    continue
+                except BaseException:
+                    break
+            try:
+                completion.result()
+            except BaseException:
+                pass
+            raise
+
+
 async def transcribe_recording(
     source: Path,
     gigaam_client: OpenAI,
@@ -223,6 +272,7 @@ async def transcribe_recording(
     primary_transcription_model: str,
     merge_model: str,
     converter: str,
+    stage_locks: StageLocks,
     artifacts_directory: Path | None = None,
     progress: Callable[[str], Awaitable[None]] | None = None,
 ) -> str:
@@ -231,22 +281,35 @@ async def transcribe_recording(
     pipeline_started = time.monotonic()
     try:
         try:
-            if progress is not None:
-                await progress(PREPARING_STATUS)
             stage_started = time.monotonic()
             LOGGER.info("Converting audio to mono 16 kHz WAV.")
-            prepare_wav(source, wav_path, converter, overwrite=True)
+            await run_serial_stage(
+                stage_locks.wav,
+                WAITING_FOR_PREPARATION_STATUS,
+                PREPARING_STATUS,
+                prepare_wav,
+                source,
+                wav_path,
+                converter,
+                True,
+                progress=progress,
+            )
             LOGGER.info("Audio conversion completed in %.1f s.", time.monotonic() - stage_started)
         except (subprocess.CalledProcessError, OSError) as error:
             raise TranscriptionError(f"The audio could not be converted: {error}") from error
 
         try:
-            if progress is not None:
-                await progress(FIRST_TRANSCRIPT_STATUS)
             stage_started = time.monotonic()
             LOGGER.info("Starting primary transcription through the inference provider.")
-            primary_result = whisper_transcribe(
-                wav_path, inference_client, primary_transcription_model
+            primary_result = await run_serial_stage(
+                stage_locks.omlx,
+                WAITING_FOR_FIRST_TRANSCRIPT_STATUS,
+                FIRST_TRANSCRIPT_STATUS,
+                whisper_transcribe,
+                wav_path,
+                inference_client,
+                primary_transcription_model,
+                progress=progress,
             )
             primary_text = primary_result.get("text")
             if not isinstance(primary_text, str) or not primary_text.strip():
@@ -260,11 +323,18 @@ async def transcribe_recording(
             raise TranscriptionError(f"The primary provider could not transcribe the audio: {error}") from error
 
         try:
-            if progress is not None:
-                await progress(SECOND_TRANSCRIPT_STATUS)
             stage_started = time.monotonic()
             LOGGER.info("Starting GigaAM secondary transcription.")
-            gigaam_result = whisper_transcribe(wav_path, gigaam_client, gigaam_model)
+            gigaam_result = await run_serial_stage(
+                stage_locks.gigaam,
+                WAITING_FOR_SECOND_TRANSCRIPT_STATUS,
+                SECOND_TRANSCRIPT_STATUS,
+                whisper_transcribe,
+                wav_path,
+                gigaam_client,
+                gigaam_model,
+                progress=progress,
+            )
             gigaam_text = gigaam_result.get("text")
             if not isinstance(gigaam_text, str) or not gigaam_text.strip():
                 raise ValueError("the service returned empty text")
@@ -277,12 +347,18 @@ async def transcribe_recording(
             raise TranscriptionError(f"GigaAM could not transcribe the audio: {error}") from error
 
         try:
-            if progress is not None:
-                await progress(MERGING_STATUS)
             stage_started = time.monotonic()
             LOGGER.info("Starting transcript merge through the inference provider.")
-            merged_result, merged_text = merge_transcripts(
-                primary_text, gigaam_text, inference_client, merge_model
+            merged_result, merged_text = await run_serial_stage(
+                stage_locks.omlx,
+                WAITING_FOR_MERGE_STATUS,
+                MERGING_STATUS,
+                merge_transcripts,
+                primary_text,
+                gigaam_text,
+                inference_client,
+                merge_model,
+                progress=progress,
             )
             if artifacts_directory is not None:
                 save_transcription_artifact(
@@ -375,7 +451,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 await edit_italic_status(status_message, text)
 
         async with context.application.bot_data["transcription_lock"]:
-            # MLX models and their streams must be used from the thread that loaded them.
+            # Keep end-to-end handling sequential until concurrent updates are enabled.
             transcript = await transcribe_recording(
                 source,
                 context.application.bot_data["gigaam_client"],
@@ -384,6 +460,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 context.application.bot_data["primary_transcription_model"],
                 context.application.bot_data["merge_model"],
                 context.application.bot_data["converter"],
+                context.application.bot_data["stage_locks"],
                 artifacts_directory,
                 report_progress,
             )
@@ -470,6 +547,7 @@ def main() -> None:
     app.bot_data.update(
         allowed_user_ids=user_ids,
         transcription_lock=asyncio.Lock(),
+        stage_locks=StageLocks(),
         gigaam_client=gigaam_client,
         gigaam_model=gigaam_model,
         inference_client=inference_client,
