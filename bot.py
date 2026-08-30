@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -17,6 +18,7 @@ from dotenv import load_dotenv
 from openai import OpenAI, OpenAIError
 from telegram import Update
 from telegram.constants import ParseMode
+from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 
 from vorec.audio import (
@@ -28,13 +30,20 @@ from vorec.audio import (
 
 
 ENV_FILE = Path(".env")
-RICH_MESSAGE_CHUNK_SIZE = 32000
-TEXT_MESSAGE_CHUNK_SIZE = 3500
 DEFAULT_PRIMARY_TRANSCRIPTION_MODEL = "whisper-large-v3-turbo-asr-fp16"
 DEFAULT_MERGE_MODEL = "gemma-4-26b-a4b-it-4bit"
 DEFAULT_GIGAAM_MODEL = "whisper-1"
 DEFAULT_CONVERTER = "ffmpeg"
 UNSUPPORTED_MESSAGE_TEXT = "This message type is not supported. Please send audio."
+DOWNLOADING_STATUS = "Downloading audio…"
+PREPARING_STATUS = "Preparing audio…"
+FIRST_TRANSCRIPT_STATUS = "Creating the first transcript…"
+SECOND_TRANSCRIPT_STATUS = "Creating the second transcript…"
+MERGING_STATUS = "Merging transcripts…"
+DELIVERY_FAILED_TEXT = "The transcript was created, but it could not be delivered."
+DELIVERY_UNCONFIRMED_TEXT = (
+    "The transcript was created, but its delivery could not be confirmed."
+)
 DEFAULT_WEBHOOK_LISTEN = "0.0.0.0"
 DEFAULT_WEBHOOK_PORT = 8080
 DATA_DIRECTORY = Path("data")
@@ -96,59 +105,117 @@ def webhook_configuration() -> tuple[str, str, str, int, str]:
     )
 
 
-def transcript_chunks(text: str, limit: int = RICH_MESSAGE_CHUNK_SIZE) -> list[str]:
-    """Split text on natural boundaries while staying below Telegram's limit."""
-    text = text.strip()
-    if not text:
-        raise TranscriptionError("The transcription service returned an empty transcript.")
-
-    chunks: list[str] = []
-    while len(text) > limit:
-        split_at = max(text.rfind("\n", 0, limit + 1), text.rfind(" ", 0, limit + 1))
-        if split_at <= 0:
-            split_at = limit
-        chunks.append(text[:split_at].rstrip())
-        text = text[split_at:].lstrip()
-    if text:
-        chunks.append(text)
-    return chunks
-
-
 async def send_rich_transcript_reply(message, bot, transcript: str) -> None:
-    """Reply with Rich Messages, falling back to regular Telegram messages."""
-    rich_messages_available = True
-    for rich_chunk in transcript_chunks(transcript):
-        if rich_messages_available:
-            data = {
-                "chat_id": message.chat_id,
-                "rich_message": {
-                    "blocks": [{"type": "paragraph", "text": rich_chunk}],
-                    "skip_entity_detection": True,
-                },
-                "reply_parameters": {"message_id": message.message_id},
-            }
-            if message.message_thread_id is not None:
-                data["message_thread_id"] = message.message_thread_id
-            try:
-                # TODO: Replace this private raw Bot API call with Bot.send_rich_message()
-                # and the library's InputRichMessage types once python-telegram-bot supports them.
-                await bot._post("sendRichMessage", data=data)
-                LOGGER.info("Sent Rich Message reply with %d characters.", len(rich_chunk))
-                continue
-            except Exception as error:
-                # PTB 22.x has no typed Rich Message API. Keep the bot useful if Telegram
-                # rejects the raw method or PTB changes its private request interface.
-                rich_messages_available = False
-                LOGGER.warning(
-                    "Rich Message delivery failed (%s); using regular messages.",
-                    error.__class__.__name__,
-                )
-
-        for text_chunk in transcript_chunks(rich_chunk, limit=TEXT_MESSAGE_CHUNK_SIZE):
-            await message.reply_text(text_chunk, reply_to_message_id=message.message_id)
+    """Send one Rich Message transcript as a reply to the source recording."""
+    data = {
+        "chat_id": message.chat_id,
+        "rich_message": {
+            "blocks": [{"type": "paragraph", "text": transcript}],
+            "skip_entity_detection": True,
+        },
+        "reply_parameters": {"message_id": message.message_id},
+    }
+    if message.message_thread_id is not None:
+        data["message_thread_id"] = message.message_thread_id
+    # TODO: Replace this private raw Bot API call with Bot.send_rich_message()
+    # and the library's InputRichMessage types once python-telegram-bot supports them.
+    await bot._post("sendRichMessage", data=data)
+    LOGGER.info("Sent Rich Message reply with %d characters.", len(transcript))
 
 
-def transcribe_recording(
+async def edit_rich_transcript_message(status_message, bot, transcript: str) -> None:
+    """Replace a status message with one Rich Message transcript."""
+    await bot._post(
+        "editMessageText",
+        data={
+            "chat_id": status_message.chat_id,
+            "message_id": status_message.message_id,
+            "rich_message": {
+                "blocks": [{"type": "paragraph", "text": transcript}],
+                "skip_entity_detection": True,
+            },
+        },
+    )
+    LOGGER.info(
+        "Replaced status with Rich Message transcript (%d characters).", len(transcript)
+    )
+
+
+async def edit_italic_status(status_message, text: str) -> bool:
+    """Best-effort edit of a status message; return whether Telegram confirmed it."""
+    try:
+        await status_message.edit_text(
+            f"<i>{html.escape(text)}</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return True
+    except Exception as error:
+        LOGGER.warning("Status message edit failed (%s).", error.__class__.__name__)
+        return False
+
+
+def delivery_outcome_is_uncertain(error: Exception) -> bool:
+    """Return whether a failed request may still have reached Telegram."""
+    return isinstance(error, (TimedOut, NetworkError)) and not isinstance(error, BadRequest)
+
+
+async def report_delivery_failure(message, status_message, *, uncertain: bool) -> None:
+    """Report a final delivery problem without attempting to resend the transcript."""
+    text = DELIVERY_UNCONFIRMED_TEXT if uncertain else DELIVERY_FAILED_TEXT
+    if status_message is not None and await edit_italic_status(status_message, text):
+        return
+    if status_message is not None:
+        return
+    try:
+        await message.reply_text(
+            f"<i>{html.escape(text)}</i>",
+            parse_mode=ParseMode.HTML,
+            reply_to_message_id=message.message_id,
+        )
+    except Exception as error:
+        LOGGER.warning("Delivery error reply failed (%s).", error.__class__.__name__)
+
+
+async def deliver_transcript(message, status_message, bot, transcript: str) -> None:
+    """Deliver a completed transcript without reporting delivery as processing failure."""
+    if status_message is None:
+        try:
+            await send_rich_transcript_reply(message, bot, transcript)
+        except Exception as error:
+            LOGGER.exception("Rich Message transcript delivery failed.")
+            await report_delivery_failure(
+                message,
+                None,
+                uncertain=delivery_outcome_is_uncertain(error),
+            )
+        return
+
+    try:
+        await edit_rich_transcript_message(status_message, bot, transcript)
+        return
+    except Exception as error:
+        LOGGER.exception("Could not replace status with the Rich Message transcript.")
+        if delivery_outcome_is_uncertain(error):
+            return
+
+    try:
+        await send_rich_transcript_reply(message, bot, transcript)
+    except Exception as fallback_error:
+        LOGGER.exception("Fallback Rich Message transcript delivery failed.")
+        await report_delivery_failure(
+            message,
+            status_message,
+            uncertain=delivery_outcome_is_uncertain(fallback_error),
+        )
+        return
+
+    await edit_italic_status(
+        status_message,
+        "Transcription complete. The result is in the next message.",
+    )
+
+
+async def transcribe_recording(
     source: Path,
     gigaam_client: OpenAI,
     gigaam_model: str,
@@ -157,12 +224,15 @@ def transcribe_recording(
     merge_model: str,
     converter: str,
     artifacts_directory: Path | None = None,
+    progress: Callable[[str], Awaitable[None]] | None = None,
 ) -> str:
     """Run both ASR engines and consolidate their results into one transcript."""
     wav_path = source.with_name(f"{source.stem}.prepared.wav")
     pipeline_started = time.monotonic()
     try:
         try:
+            if progress is not None:
+                await progress(PREPARING_STATUS)
             stage_started = time.monotonic()
             LOGGER.info("Converting audio to mono 16 kHz WAV.")
             prepare_wav(source, wav_path, converter, overwrite=True)
@@ -171,6 +241,8 @@ def transcribe_recording(
             raise TranscriptionError(f"The audio could not be converted: {error}") from error
 
         try:
+            if progress is not None:
+                await progress(FIRST_TRANSCRIPT_STATUS)
             stage_started = time.monotonic()
             LOGGER.info("Starting primary transcription through the inference provider.")
             primary_result = whisper_transcribe(
@@ -188,6 +260,8 @@ def transcribe_recording(
             raise TranscriptionError(f"The primary provider could not transcribe the audio: {error}") from error
 
         try:
+            if progress is not None:
+                await progress(SECOND_TRANSCRIPT_STATUS)
             stage_started = time.monotonic()
             LOGGER.info("Starting GigaAM secondary transcription.")
             gigaam_result = whisper_transcribe(wav_path, gigaam_client, gigaam_model)
@@ -203,6 +277,8 @@ def transcribe_recording(
             raise TranscriptionError(f"GigaAM could not transcribe the audio: {error}") from error
 
         try:
+            if progress is not None:
+                await progress(MERGING_STATUS)
             stage_started = time.monotonic()
             LOGGER.info("Starting transcript merge through the inference provider.")
             merged_result, merged_text = merge_transcripts(
@@ -273,6 +349,16 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if attachment is None:
         return
 
+    status_message = None
+    try:
+        status_message = await message.reply_text(
+            f"<i>{DOWNLOADING_STATUS}</i>",
+            parse_mode=ParseMode.HTML,
+            reply_to_message_id=message.message_id,
+        )
+    except Exception as error:
+        LOGGER.warning("Could not create transcription status (%s).", error.__class__.__name__)
+
     try:
         source, artifacts_directory = recording_paths(message)
         source.parent.mkdir(parents=True, exist_ok=True)
@@ -284,9 +370,13 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         except Exception as error:
             raise TranscriptionError(f"The audio could not be downloaded: {error}") from error
 
+        async def report_progress(text: str) -> None:
+            if status_message is not None:
+                await edit_italic_status(status_message, text)
+
         async with context.application.bot_data["transcription_lock"]:
             # MLX models and their streams must be used from the thread that loaded them.
-            transcript = transcribe_recording(
+            transcript = await transcribe_recording(
                 source,
                 context.application.bot_data["gigaam_client"],
                 context.application.bot_data["gigaam_model"],
@@ -295,9 +385,8 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 context.application.bot_data["merge_model"],
                 context.application.bot_data["converter"],
                 artifacts_directory,
+                report_progress,
             )
-
-        await send_rich_transcript_reply(message, context.bot, transcript)
     except Exception as error:
         LOGGER.exception("Failed to process audio from Telegram user %s", user.id)
         reason = (
@@ -306,13 +395,23 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             else f"An unexpected internal error occurred ({error.__class__.__name__})."
         )
         error_text = f"Could not transcribe the audio: {reason}"
-        # Keep enough headroom for HTML entity expansion as well as the <i> tags.
-        escaped_text = html.escape(error_text[:600])
-        await message.reply_text(
-            f"<i>{escaped_text}</i>",
-            parse_mode=ParseMode.HTML,
-            reply_to_message_id=message.message_id,
-        )
+        if status_message is not None and await edit_italic_status(
+            status_message, error_text[:600]
+        ):
+            return
+        try:
+            await message.reply_text(
+                f"<i>{html.escape(error_text[:600])}</i>",
+                parse_mode=ParseMode.HTML,
+                reply_to_message_id=message.message_id,
+            )
+        except Exception as reply_error:
+            LOGGER.warning(
+                "Processing error reply failed (%s).", reply_error.__class__.__name__
+            )
+        return
+
+    await deliver_transcript(message, status_message, context.bot, transcript)
 
 
 async def handle_unsupported_message(

@@ -8,16 +8,25 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from bot import (
     ConfigurationError,
+    DELIVERY_FAILED_TEXT,
+    DELIVERY_UNCONFIRMED_TEXT,
+    FIRST_TRANSCRIPT_STATUS,
+    MERGING_STATUS,
+    PREPARING_STATUS,
+    SECOND_TRANSCRIPT_STATUS,
     TranscriptionError,
     UNSUPPORTED_MESSAGE_TEXT,
     allowed_user_ids,
+    deliver_transcript,
+    edit_rich_transcript_message,
+    handle_audio,
     handle_unsupported_message,
     recording_paths,
     send_rich_transcript_reply,
-    transcript_chunks,
     transcribe_recording,
     webhook_configuration,
 )
+from telegram.error import BadRequest, TimedOut
 from vorec.audio import prepare_wav, resolve_converter
 
 
@@ -91,21 +100,6 @@ class WebhookConfigurationTests(unittest.TestCase):
             webhook_configuration()
 
 
-class TranscriptChunksTests(unittest.TestCase):
-    def test_preserves_text_across_chunks(self) -> None:
-        text = "alpha beta gamma delta"
-        chunks = transcript_chunks(text, limit=12)
-        self.assertEqual(chunks, ["alpha beta", "gamma delta"])
-        self.assertEqual(" ".join(chunks), text)
-
-    def test_splits_long_words_at_limit(self) -> None:
-        self.assertEqual(transcript_chunks("abcdefgh", limit=3), ["abc", "def", "gh"])
-
-    def test_rejects_empty_transcript(self) -> None:
-        with self.assertRaisesRegex(TranscriptionError, "empty transcript"):
-            transcript_chunks("  ")
-
-
 class RichMessageTests(unittest.TestCase):
     def test_sends_rich_message_as_reply(self) -> None:
         message = Mock(chat_id=123, message_id=456, message_thread_id=None)
@@ -127,18 +121,267 @@ class RichMessageTests(unittest.TestCase):
         )
         message.reply_text.assert_not_called()
 
-    def test_falls_back_to_regular_message_chunks(self) -> None:
+    def test_edits_status_into_rich_message(self) -> None:
+        status_message = Mock(chat_id=123, message_id=789)
+        bot = Mock()
+        bot._post = AsyncMock()
+
+        asyncio.run(edit_rich_transcript_message(status_message, bot, "final text"))
+
+        bot._post.assert_awaited_once_with(
+            "editMessageText",
+            data={
+                "chat_id": 123,
+                "message_id": 789,
+                "rich_message": {
+                    "blocks": [{"type": "paragraph", "text": "final text"}],
+                    "skip_entity_detection": True,
+                },
+            },
+        )
+
+
+class TranscriptDeliveryTests(unittest.TestCase):
+    def test_sends_reply_when_status_was_not_created(self) -> None:
+        message = Mock(chat_id=123, message_id=456, message_thread_id=None)
+        bot = Mock(_post=AsyncMock())
+
+        asyncio.run(deliver_transcript(message, None, bot, "final text"))
+
+        bot._post.assert_awaited_once()
+        self.assertEqual(bot._post.await_args.args[0], "sendRichMessage")
+
+    def test_failed_delivery_without_status_sends_delivery_error_reply(self) -> None:
         message = Mock(chat_id=123, message_id=456, message_thread_id=None)
         message.reply_text = AsyncMock()
+        bot = Mock(_post=AsyncMock(side_effect=BadRequest("send rejected")))
+
+        asyncio.run(deliver_transcript(message, None, bot, "final text"))
+
+        bot._post.assert_awaited_once()
+        message.reply_text.assert_awaited_once_with(
+            f"<i>{DELIVERY_FAILED_TEXT}</i>",
+            parse_mode="HTML",
+            reply_to_message_id=456,
+        )
+
+    def test_definitive_edit_failure_uses_one_fallback_reply(self) -> None:
+        message = Mock(chat_id=123, message_id=456, message_thread_id=None)
+        status = Mock(chat_id=123, message_id=789)
+        status.edit_text = AsyncMock()
         bot = Mock()
-        bot._post = AsyncMock(side_effect=RuntimeError("unsupported method"))
+        bot._post = AsyncMock(side_effect=[BadRequest("rejected"), True])
 
-        asyncio.run(send_rich_transcript_reply(message, bot, "a" * 4000))
+        asyncio.run(deliver_transcript(message, status, bot, "final text"))
 
-        self.assertEqual(message.reply_text.await_count, 2)
-        for call in message.reply_text.await_args_list:
-            self.assertLessEqual(len(call.args[0]), 3500)
-            self.assertEqual(call.kwargs["reply_to_message_id"], 456)
+        self.assertEqual(bot._post.await_count, 2)
+        self.assertEqual(bot._post.await_args_list[0].args[0], "editMessageText")
+        self.assertEqual(bot._post.await_args_list[1].args[0], "sendRichMessage")
+        status.edit_text.assert_awaited_once_with(
+            "<i>Transcription complete. The result is in the next message.</i>",
+            parse_mode="HTML",
+        )
+
+    def test_both_delivery_methods_fail_without_transcription_error(self) -> None:
+        message = Mock(chat_id=123, message_id=456, message_thread_id=None)
+        status = Mock(chat_id=123, message_id=789)
+        status.edit_text = AsyncMock()
+        bot = Mock()
+        bot._post = AsyncMock(
+            side_effect=[BadRequest("edit rejected"), BadRequest("send rejected")]
+        )
+
+        asyncio.run(deliver_transcript(message, status, bot, "final text"))
+
+        self.assertEqual(bot._post.await_count, 2)
+        status.edit_text.assert_awaited_once_with(
+            f"<i>{DELIVERY_FAILED_TEXT}</i>",
+            parse_mode="HTML",
+        )
+        message.reply_text.assert_not_called()
+
+    def test_uncertain_edit_is_not_retried(self) -> None:
+        message = Mock(chat_id=123, message_id=456, message_thread_id=None)
+        status = Mock(chat_id=123, message_id=789)
+        status.edit_text = AsyncMock()
+        bot = Mock(_post=AsyncMock(side_effect=TimedOut("unknown outcome")))
+
+        asyncio.run(deliver_transcript(message, status, bot, "final text"))
+
+        bot._post.assert_awaited_once()
+        status.edit_text.assert_not_awaited()
+
+    def test_uncertain_fallback_is_not_retried(self) -> None:
+        message = Mock(chat_id=123, message_id=456, message_thread_id=None)
+        status = Mock(chat_id=123, message_id=789)
+        status.edit_text = AsyncMock()
+        bot = Mock()
+        bot._post = AsyncMock(
+            side_effect=[BadRequest("edit rejected"), TimedOut("unknown outcome")]
+        )
+
+        asyncio.run(deliver_transcript(message, status, bot, "final text"))
+
+        self.assertEqual(bot._post.await_count, 2)
+        status.edit_text.assert_awaited_once_with(
+            f"<i>{DELIVERY_UNCONFIRMED_TEXT}</i>",
+            parse_mode="HTML",
+        )
+
+
+class HandleAudioTests(unittest.TestCase):
+    def audio_request(self, source: Path, status_result):
+        telegram_file = Mock()
+        telegram_file.download_to_drive = AsyncMock(
+            side_effect=lambda custom_path: Path(custom_path).touch()
+        )
+        attachment = Mock(file_name="memo.ogg")
+        attachment.get_file = AsyncMock(return_value=telegram_file)
+        message = Mock(
+            chat_id=123,
+            message_id=456,
+            message_thread_id=None,
+            voice=attachment,
+            audio=None,
+            document=None,
+        )
+        if isinstance(status_result, BaseException):
+            message.reply_text = AsyncMock(side_effect=status_result)
+        else:
+            message.reply_text = AsyncMock(return_value=status_result)
+        update = Mock(effective_message=message, effective_user=Mock(id=123))
+        bot = Mock(_post=AsyncMock())
+        context = Mock(bot=bot)
+        context.application.bot_data = {
+            "allowed_user_ids": {123},
+            "transcription_lock": asyncio.Lock(),
+            "gigaam_client": Mock(),
+            "gigaam_model": "gigaam-model",
+            "inference_client": Mock(),
+            "primary_transcription_model": "whisper-model",
+            "merge_model": "merge-model",
+            "converter": "ffmpeg",
+        }
+        artifacts = source.parent / "artifacts"
+        return update, context, message, bot, artifacts
+
+    @patch("bot.transcribe_recording")
+    @patch("bot.recording_paths")
+    def test_updates_one_status_then_replaces_it_with_transcript(
+        self, recording_paths, transcribe_recording
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / "audio.ogg"
+            status = Mock(chat_id=123, message_id=789)
+            status.edit_text = AsyncMock()
+            update, context, message, bot, artifacts = self.audio_request(source, status)
+            recording_paths.return_value = (source, artifacts)
+
+            async def transcribe(*args):
+                progress = args[-1]
+                for stage in (
+                    PREPARING_STATUS,
+                    FIRST_TRANSCRIPT_STATUS,
+                    SECOND_TRANSCRIPT_STATUS,
+                    MERGING_STATUS,
+                ):
+                    await progress(stage)
+                return "final text"
+
+            transcribe_recording.side_effect = transcribe
+            asyncio.run(handle_audio(update, context))
+
+        self.assertEqual(message.reply_text.await_count, 1)
+        message.reply_text.assert_awaited_once_with(
+            "<i>Downloading audio…</i>",
+            parse_mode="HTML",
+            reply_to_message_id=456,
+        )
+        self.assertEqual(
+            [call.args[0] for call in status.edit_text.await_args_list],
+            [
+                f"<i>{PREPARING_STATUS}</i>",
+                f"<i>{FIRST_TRANSCRIPT_STATUS}</i>",
+                f"<i>{SECOND_TRANSCRIPT_STATUS}</i>",
+                f"<i>{MERGING_STATUS}</i>",
+            ],
+        )
+        bot._post.assert_awaited_once()
+        self.assertEqual(bot._post.await_args.args[0], "editMessageText")
+
+    @patch("bot.transcribe_recording", new_callable=AsyncMock, return_value="final text")
+    @patch("bot.recording_paths")
+    def test_status_creation_failure_still_delivers_successful_transcript(
+        self, recording_paths, transcribe_recording
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / "audio.ogg"
+            update, context, message, bot, artifacts = self.audio_request(
+                source, RuntimeError("status unavailable")
+            )
+            recording_paths.return_value = (source, artifacts)
+
+            asyncio.run(handle_audio(update, context))
+
+        transcribe_recording.assert_awaited_once()
+        bot._post.assert_awaited_once()
+        self.assertEqual(bot._post.await_args.args[0], "sendRichMessage")
+
+    @patch(
+        "bot.transcribe_recording",
+        new_callable=AsyncMock,
+        side_effect=TranscriptionError("provider failed"),
+    )
+    @patch("bot.recording_paths")
+    def test_processing_failure_replaces_existing_status(
+        self, recording_paths, transcribe_recording
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / "audio.ogg"
+            status = Mock(chat_id=123, message_id=789)
+            status.edit_text = AsyncMock()
+            update, context, message, bot, artifacts = self.audio_request(source, status)
+            recording_paths.return_value = (source, artifacts)
+
+            asyncio.run(handle_audio(update, context))
+
+        status.edit_text.assert_awaited_once_with(
+            "<i>Could not transcribe the audio: provider failed</i>",
+            parse_mode="HTML",
+        )
+        bot._post.assert_not_awaited()
+
+    @patch("bot.transcribe_recording")
+    @patch("bot.recording_paths")
+    def test_intermediate_status_failure_does_not_stop_processing(
+        self, recording_paths, transcribe_recording
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / "audio.ogg"
+            status = Mock(chat_id=123, message_id=789)
+            status.edit_text = AsyncMock(
+                side_effect=[RuntimeError("edit failed"), None, None, None]
+            )
+            update, context, message, bot, artifacts = self.audio_request(source, status)
+            recording_paths.return_value = (source, artifacts)
+
+            async def transcribe(*args):
+                progress = args[-1]
+                for stage in (
+                    PREPARING_STATUS,
+                    FIRST_TRANSCRIPT_STATUS,
+                    SECOND_TRANSCRIPT_STATUS,
+                    MERGING_STATUS,
+                ):
+                    await progress(stage)
+                return "final text"
+
+            transcribe_recording.side_effect = transcribe
+            asyncio.run(handle_audio(update, context))
+
+        self.assertEqual(status.edit_text.await_count, 4)
+        bot._post.assert_awaited_once()
+        self.assertEqual(bot._post.await_args.args[0], "editMessageText")
 
 
 class UnsupportedMessageTests(unittest.TestCase):
@@ -179,19 +422,27 @@ class TranscribeRecordingTests(unittest.TestCase):
     def test_runs_both_engines_and_returns_merged_text(
         self, prepare_wav, whisper_transcribe, merge_transcripts
     ) -> None:
+        stages = []
+
+        async def progress(stage: str) -> None:
+            stages.append(stage)
+
         with TemporaryDirectory() as directory:
             source = Path(directory) / "audio.ogg"
             artifacts_directory = Path(directory) / "transcripts"
             source.touch()
-            result = transcribe_recording(
-                source,
-                Mock(),
-                "gigaam-model",
-                Mock(),
-                "whisper-model",
-                "merge-model",
-                "afconvert",
-                artifacts_directory,
+            result = asyncio.run(
+                transcribe_recording(
+                    source,
+                    Mock(),
+                    "gigaam-model",
+                    Mock(),
+                    "whisper-model",
+                    "merge-model",
+                    "afconvert",
+                    artifacts_directory,
+                    progress,
+                )
             )
 
             self.assertEqual(
@@ -201,6 +452,15 @@ class TranscribeRecordingTests(unittest.TestCase):
             self.assertEqual((artifacts_directory / "merged.txt").read_text(), "merged text\n")
 
         self.assertEqual(result, "merged text")
+        self.assertEqual(
+            stages,
+            [
+                PREPARING_STATUS,
+                FIRST_TRANSCRIPT_STATUS,
+                SECOND_TRANSCRIPT_STATUS,
+                MERGING_STATUS,
+            ],
+        )
         prepare_wav.assert_called_once()
         self.assertEqual(whisper_transcribe.call_count, 2)
         merge_transcripts.assert_called_once()
@@ -211,14 +471,16 @@ class TranscribeRecordingTests(unittest.TestCase):
             source = Path(directory) / "audio.ogg"
             source.touch()
             with self.assertRaisesRegex(TranscriptionError, "could not be converted"):
-                transcribe_recording(
-                    source,
-                    Mock(),
-                    "gigaam-model",
-                    Mock(),
-                    "whisper-model",
-                    "merge-model",
-                    "afconvert",
+                asyncio.run(
+                    transcribe_recording(
+                        source,
+                        Mock(),
+                        "gigaam-model",
+                        Mock(),
+                        "whisper-model",
+                        "merge-model",
+                        "afconvert",
+                    )
                 )
 
     @patch("bot.merge_transcripts", return_value=({}, "text"))
@@ -230,14 +492,16 @@ class TranscribeRecordingTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             source = Path(directory) / "audio.wav"
             source.touch()
-            transcribe_recording(
-                source,
-                Mock(),
-                "gigaam-model",
-                Mock(),
-                "whisper-model",
-                "merge-model",
-                "afconvert",
+            asyncio.run(
+                transcribe_recording(
+                    source,
+                    Mock(),
+                    "gigaam-model",
+                    Mock(),
+                    "whisper-model",
+                    "merge-model",
+                    "afconvert",
+                )
             )
 
         converted_path = prepare_wav.call_args.args[1]
