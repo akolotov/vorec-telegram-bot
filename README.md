@@ -47,6 +47,11 @@ Telegram → Tailscale Funnel → tailscale-ingress → bot container → GigaAM
   `INFERENCE_API_KEY`.
 - **Docker** runs only the bot; MLX stays native on Apple Silicon.
 
+Set `SMART_TRANSCRIPTION_SCHEDULING=true` only when Whisper and GigaAM have independent
+capacity. In that mode, concurrent recordings can start with whichever ASR resource is available,
+but each recording still uses only one ASR at a time and completes both before merge. The setting
+defaults to `false`; its value must be `true` or `false`.
+
 All configuration, including API URLs and tokens, is in `.env`. Start by copying `.env.example`.
 
 ## Webhook through Tailscale Funnel
@@ -136,7 +141,9 @@ message ID (`YYYY-MM-DD_HH-MM-SS_<chat-id>_<message-id>`):
 
 The intermediate converted WAV is deleted after processing. The `data/` directory is intentionally
 excluded from Git. Incoming messages are handled concurrently, while the bot serializes each
-ffmpeg, GigaAM, and oMLX stage and reports when a recording is waiting for one of them.
+ffmpeg, GigaAM, and oMLX stage and reports when a recording is waiting for one of them. Smart
+transcription scheduling coordinates capacity only within one bot process; separate deployments
+that share a provider must rely on that provider to enforce its own global capacity.
 
 `manage.sh` does not install dependencies. It checks the local GigaAM health endpoint first. Only
 the GigaAM manager checks for `.venv`, tmux, and the model directory when it needs to start a new
