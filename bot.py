@@ -30,6 +30,7 @@ from vorec.audio import (
     resolve_converter,
     whisper_transcribe,
 )
+from vorec.scheduling import TranscriptionResource, TranscriptionScheduler
 
 
 ENV_FILE = Path(".env")
@@ -47,6 +48,11 @@ WAITING_FOR_PREPARATION_STATUS = "Waiting to prepare audio…"
 WAITING_FOR_FIRST_TRANSCRIPT_STATUS = "Waiting to create the first transcript…"
 WAITING_FOR_SECOND_TRANSCRIPT_STATUS = "Waiting to create the second transcript…"
 WAITING_FOR_MERGE_STATUS = "Waiting to merge transcripts…"
+WAITING_FOR_TRANSCRIPTION_PROVIDER_STATUS = "Waiting for a transcription provider…"
+WAITING_FOR_WHISPER_STATUS = "Waiting for Whisper…"
+WAITING_FOR_GIGAAM_STATUS = "Waiting for GigaAM…"
+WHISPER_TRANSCRIPTION_STATUS = "Transcribing with Whisper…"
+GIGAAM_TRANSCRIPTION_STATUS = "Transcribing with GigaAM…"
 DELIVERY_FAILED_TEXT = "The transcript was created, but it could not be delivered."
 DELIVERY_UNCONFIRMED_TEXT = (
     "The transcript was created, but its delivery could not be confirmed."
@@ -82,6 +88,19 @@ def required_env(name: str) -> str:
     if not value:
         raise ConfigurationError(f"{name} is not configured.")
     return value
+
+
+def boolean_env(name: str, default: bool = False) -> bool:
+    """Return a strict true/false environment setting."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise ConfigurationError(f"{name} must be either true or false.")
 
 
 def allowed_user_ids(value: str) -> set[int]:
@@ -288,22 +307,80 @@ async def run_serial_stage(
     async with lock:
         if progress is not None:
             await progress(active_status)
-        completion = asyncio.create_task(asyncio.to_thread(operation, *args))
-        try:
-            return await asyncio.shield(completion)
-        except asyncio.CancelledError:
-            while not completion.done():
-                try:
-                    await asyncio.shield(completion)
-                except asyncio.CancelledError:
-                    continue
-                except BaseException:
-                    break
+        return await run_blocking_operation(operation, *args)
+
+
+async def run_blocking_operation(
+    operation: Callable[..., T], *args: object
+) -> T:
+    """Run blocking work without abandoning it or its resource on cancellation."""
+    completion = asyncio.create_task(asyncio.to_thread(operation, *args))
+    try:
+        return await asyncio.shield(completion)
+    except asyncio.CancelledError:
+        while not completion.done():
             try:
-                completion.result()
+                await asyncio.shield(completion)
+            except asyncio.CancelledError:
+                continue
             except BaseException:
-                pass
-            raise
+                break
+        try:
+            completion.result()
+        except BaseException:
+            pass
+        raise
+
+
+async def run_scheduled_asr(
+    resource: TranscriptionResource,
+    wav_path: Path,
+    gigaam_client: OpenAI,
+    gigaam_model: str,
+    inference_client: OpenAI,
+    primary_transcription_model: str,
+    artifacts_directory: Path | None,
+    progress: Callable[[str], Awaitable[None]] | None,
+) -> str:
+    """Run the ASR operation selected by the smart scheduler."""
+    if resource is TranscriptionResource.INFERENCE:
+        active_status = WHISPER_TRANSCRIPTION_STATUS
+        client = inference_client
+        model = primary_transcription_model
+        artifact_name = "whisper"
+        log_name = "Whisper"
+        error_prefix = "The primary provider could not transcribe the audio"
+    else:
+        active_status = GIGAAM_TRANSCRIPTION_STATUS
+        client = gigaam_client
+        model = gigaam_model
+        artifact_name = "gigaam"
+        log_name = "GigaAM"
+        error_prefix = "GigaAM could not transcribe the audio"
+
+    try:
+        if progress is not None:
+            await progress(active_status)
+        stage_started = time.monotonic()
+        LOGGER.info("Starting %s transcription.", log_name)
+        result = await run_blocking_operation(
+            whisper_transcribe, wav_path, client, model
+        )
+        text = result.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("the service returned empty text")
+        if artifacts_directory is not None:
+            save_transcription_artifact(
+                artifacts_directory, artifact_name, result, text
+            )
+        LOGGER.info(
+            "%s transcription completed in %.1f s.",
+            log_name,
+            time.monotonic() - stage_started,
+        )
+        return text
+    except (OpenAIError, OSError, ValueError) as error:
+        raise TranscriptionError(f"{error_prefix}: {error}") from error
 
 
 async def transcribe_recording(
@@ -317,6 +394,7 @@ async def transcribe_recording(
     stage_locks: StageLocks,
     artifacts_directory: Path | None = None,
     progress: Callable[[str], Awaitable[None]] | None = None,
+    scheduler: TranscriptionScheduler | None = None,
 ) -> str:
     """Run both ASR engines and consolidate their results into one transcript."""
     wav_path = source.with_name(f"{source.stem}.prepared.wav")
@@ -340,68 +418,136 @@ async def transcribe_recording(
         except (subprocess.CalledProcessError, OSError) as error:
             raise TranscriptionError(f"The audio could not be converted: {error}") from error
 
-        try:
-            stage_started = time.monotonic()
-            LOGGER.info("Starting primary transcription through the inference provider.")
-            primary_result = await run_serial_stage(
-                stage_locks.omlx,
-                WAITING_FOR_FIRST_TRANSCRIPT_STATUS,
-                FIRST_TRANSCRIPT_STATUS,
-                whisper_transcribe,
-                wav_path,
-                inference_client,
-                primary_transcription_model,
-                progress=progress,
-            )
-            primary_text = primary_result.get("text")
-            if not isinstance(primary_text, str) or not primary_text.strip():
-                raise ValueError("the service returned empty text")
-            if artifacts_directory is not None:
-                save_transcription_artifact(
-                    artifacts_directory, "whisper", primary_result, primary_text
+        if scheduler is None:
+            try:
+                stage_started = time.monotonic()
+                LOGGER.info("Starting primary transcription through the inference provider.")
+                primary_result = await run_serial_stage(
+                    stage_locks.omlx,
+                    WAITING_FOR_FIRST_TRANSCRIPT_STATUS,
+                    FIRST_TRANSCRIPT_STATUS,
+                    whisper_transcribe,
+                    wav_path,
+                    inference_client,
+                    primary_transcription_model,
+                    progress=progress,
                 )
-            LOGGER.info("Primary transcription completed in %.1f s.", time.monotonic() - stage_started)
-        except (OpenAIError, OSError, ValueError) as error:
-            raise TranscriptionError(f"The primary provider could not transcribe the audio: {error}") from error
+                primary_text = primary_result.get("text")
+                if not isinstance(primary_text, str) or not primary_text.strip():
+                    raise ValueError("the service returned empty text")
+                if artifacts_directory is not None:
+                    save_transcription_artifact(
+                        artifacts_directory, "whisper", primary_result, primary_text
+                    )
+                LOGGER.info(
+                    "Primary transcription completed in %.1f s.",
+                    time.monotonic() - stage_started,
+                )
+            except (OpenAIError, OSError, ValueError) as error:
+                raise TranscriptionError(
+                    f"The primary provider could not transcribe the audio: {error}"
+                ) from error
 
-        try:
-            stage_started = time.monotonic()
-            LOGGER.info("Starting GigaAM secondary transcription.")
-            gigaam_result = await run_serial_stage(
-                stage_locks.gigaam,
-                WAITING_FOR_SECOND_TRANSCRIPT_STATUS,
-                SECOND_TRANSCRIPT_STATUS,
-                whisper_transcribe,
-                wav_path,
-                gigaam_client,
-                gigaam_model,
-                progress=progress,
-            )
-            gigaam_text = gigaam_result.get("text")
-            if not isinstance(gigaam_text, str) or not gigaam_text.strip():
-                raise ValueError("the service returned empty text")
-            if artifacts_directory is not None:
-                save_transcription_artifact(
-                    artifacts_directory, "gigaam", gigaam_result, gigaam_text
+            try:
+                stage_started = time.monotonic()
+                LOGGER.info("Starting GigaAM secondary transcription.")
+                gigaam_result = await run_serial_stage(
+                    stage_locks.gigaam,
+                    WAITING_FOR_SECOND_TRANSCRIPT_STATUS,
+                    SECOND_TRANSCRIPT_STATUS,
+                    whisper_transcribe,
+                    wav_path,
+                    gigaam_client,
+                    gigaam_model,
+                    progress=progress,
                 )
-            LOGGER.info("GigaAM transcription completed in %.1f s.", time.monotonic() - stage_started)
-        except (OpenAIError, OSError, ValueError) as error:
-            raise TranscriptionError(f"GigaAM could not transcribe the audio: {error}") from error
+                gigaam_text = gigaam_result.get("text")
+                if not isinstance(gigaam_text, str) or not gigaam_text.strip():
+                    raise ValueError("the service returned empty text")
+                if artifacts_directory is not None:
+                    save_transcription_artifact(
+                        artifacts_directory, "gigaam", gigaam_result, gigaam_text
+                    )
+                LOGGER.info(
+                    "GigaAM transcription completed in %.1f s.",
+                    time.monotonic() - stage_started,
+                )
+            except (OpenAIError, OSError, ValueError) as error:
+                raise TranscriptionError(
+                    f"GigaAM could not transcribe the audio: {error}"
+                ) from error
+        else:
+            transcripts: dict[TranscriptionResource, str] = {}
+            remaining = (
+                TranscriptionResource.INFERENCE,
+                TranscriptionResource.GIGAAM,
+            )
+            for _ in range(2):
+                waiting_status = (
+                    WAITING_FOR_TRANSCRIPTION_PROVIDER_STATUS
+                    if len(remaining) == 2
+                    else (
+                        WAITING_FOR_WHISPER_STATUS
+                        if remaining[0] is TranscriptionResource.INFERENCE
+                        else WAITING_FOR_GIGAAM_STATUS
+                    )
+                )
+
+                async def report_waiting(status: str = waiting_status) -> None:
+                    if progress is not None:
+                        await progress(status)
+
+                async with scheduler.reserve(
+                    remaining, on_wait=report_waiting
+                ) as resource:
+                    transcripts[resource] = await run_scheduled_asr(
+                        resource,
+                        wav_path,
+                        gigaam_client,
+                        gigaam_model,
+                        inference_client,
+                        primary_transcription_model,
+                        artifacts_directory,
+                        progress,
+                    )
+                remaining = tuple(item for item in remaining if item is not resource)
+
+            primary_text = transcripts[TranscriptionResource.INFERENCE]
+            gigaam_text = transcripts[TranscriptionResource.GIGAAM]
 
         try:
             stage_started = time.monotonic()
             LOGGER.info("Starting transcript merge through the inference provider.")
-            merged_result, merged_text = await run_serial_stage(
-                stage_locks.omlx,
-                WAITING_FOR_MERGE_STATUS,
-                MERGING_STATUS,
-                merge_transcripts,
-                primary_text,
-                gigaam_text,
-                inference_client,
-                merge_model,
-                progress=progress,
-            )
+            if scheduler is None:
+                merged_result, merged_text = await run_serial_stage(
+                    stage_locks.omlx,
+                    WAITING_FOR_MERGE_STATUS,
+                    MERGING_STATUS,
+                    merge_transcripts,
+                    primary_text,
+                    gigaam_text,
+                    inference_client,
+                    merge_model,
+                    progress=progress,
+                )
+            else:
+                async def report_merge_waiting() -> None:
+                    if progress is not None:
+                        await progress(WAITING_FOR_MERGE_STATUS)
+
+                async with scheduler.reserve(
+                    (TranscriptionResource.INFERENCE,),
+                    on_wait=report_merge_waiting,
+                ):
+                    if progress is not None:
+                        await progress(MERGING_STATUS)
+                    merged_result, merged_text = await run_blocking_operation(
+                        merge_transcripts,
+                        primary_text,
+                        gigaam_text,
+                        inference_client,
+                        merge_model,
+                    )
             if artifacts_directory is not None:
                 save_transcription_artifact(
                     artifacts_directory, "merged", merged_result, merged_text
@@ -504,6 +650,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             context.application.bot_data["stage_locks"],
             artifacts_directory,
             report_progress,
+            scheduler=context.application.bot_data["transcription_scheduler"],
         )
     except Exception as error:
         LOGGER.exception("Failed to process audio from Telegram user %s", user.id)
@@ -561,6 +708,7 @@ def main() -> None:
         webhook_configuration()
     )
     converter = resolve_converter(os.getenv("AUDIO_CONVERTER", DEFAULT_CONVERTER))
+    smart_scheduling = boolean_env("SMART_TRANSCRIPTION_SCHEDULING")
     if not shutil.which(converter):
         raise ConfigurationError(f"Audio converter executable not found: {converter}")
 
@@ -582,6 +730,7 @@ def main() -> None:
         api_key=required_env("INFERENCE_API_KEY"),
         timeout=600,
     )
+    scheduler = TranscriptionScheduler() if smart_scheduling else None
 
     audio_messages = filters.VOICE | filters.AUDIO | filters.Document.Category("audio/")
     app = ApplicationBuilder().token(token).concurrent_updates(True).build()
@@ -596,6 +745,7 @@ def main() -> None:
         ),
         merge_model=os.getenv("MERGE_MODEL", DEFAULT_MERGE_MODEL),
         converter=converter,
+        transcription_scheduler=scheduler,
     )
     app.add_handler(MessageHandler(filters.User(user_id=user_ids) & audio_messages, handle_audio))
     app.add_handler(

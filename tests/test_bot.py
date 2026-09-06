@@ -13,6 +13,7 @@ from bot import (
     DELIVERY_FAILED_TEXT,
     DELIVERY_UNCONFIRMED_TEXT,
     FIRST_TRANSCRIPT_STATUS,
+    GIGAAM_TRANSCRIPTION_STATUS,
     MERGING_STATUS,
     PREPARING_STATUS,
     SECOND_TRANSCRIPT_STATUS,
@@ -22,7 +23,9 @@ from bot import (
     WAITING_FOR_FIRST_TRANSCRIPT_STATUS,
     WAITING_FOR_MERGE_STATUS,
     WAITING_FOR_PREPARATION_STATUS,
+    WHISPER_TRANSCRIPTION_STATUS,
     allowed_user_ids,
+    boolean_env,
     deliver_transcript,
     edit_rich_transcript_message,
     handle_audio,
@@ -36,6 +39,7 @@ from bot import (
 )
 from telegram.error import BadRequest, NetworkError, TimedOut
 from vorec.audio import prepare_wav, resolve_converter
+from vorec.scheduling import TranscriptionScheduler
 
 
 class AllowedUserIdsTests(unittest.TestCase):
@@ -49,6 +53,33 @@ class AllowedUserIdsTests(unittest.TestCase):
     def test_rejects_empty_list(self) -> None:
         with self.assertRaisesRegex(ConfigurationError, "at least one user ID"):
             allowed_user_ids(" , ")
+
+
+class BooleanEnvironmentTests(unittest.TestCase):
+    def test_uses_default_when_setting_is_absent(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(boolean_env("SMART_TRANSCRIPTION_SCHEDULING"))
+
+    def test_accepts_true_and_false_case_insensitively(self) -> None:
+        for value, expected in ((" TrUe ", True), ("FALSE", False)):
+            with self.subTest(value=value):
+                with patch.dict(
+                    os.environ,
+                    {"SMART_TRANSCRIPTION_SCHEDULING": value},
+                    clear=True,
+                ):
+                    self.assertIs(
+                        boolean_env("SMART_TRANSCRIPTION_SCHEDULING"), expected
+                    )
+
+    def test_rejects_unknown_value(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"SMART_TRANSCRIPTION_SCHEDULING": "yes"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ConfigurationError, "true or false"):
+                boolean_env("SMART_TRANSCRIPTION_SCHEDULING")
 
 
 class PersistentStorageTests(unittest.TestCase):
@@ -447,6 +478,7 @@ class HandleAudioTests(unittest.TestCase):
             "primary_transcription_model": "whisper-model",
             "merge_model": "merge-model",
             "converter": "ffmpeg",
+            "transcription_scheduler": None,
         }
         artifacts = source.parent / "artifacts"
         return update, context, message, bot, artifacts
@@ -463,7 +495,7 @@ class HandleAudioTests(unittest.TestCase):
             update, context, message, bot, artifacts = self.audio_request(source, status)
             recording_paths.return_value = (source, artifacts)
 
-            async def transcribe(*args):
+            async def transcribe(*args, **kwargs):
                 progress = args[-1]
                 for stage in (
                     PREPARING_STATUS,
@@ -551,7 +583,7 @@ class HandleAudioTests(unittest.TestCase):
             update, context, message, bot, artifacts = self.audio_request(source, status)
             recording_paths.return_value = (source, artifacts)
 
-            async def transcribe(*args):
+            async def transcribe(*args, **kwargs):
                 progress = args[-1]
                 for stage in (
                     PREPARING_STATUS,
@@ -598,7 +630,7 @@ class HandleAudioTests(unittest.TestCase):
                 second_started = asyncio.Event()
                 release = asyncio.Event()
 
-                async def transcribe(*args):
+                async def transcribe(*args, **kwargs):
                     if not first_started.is_set():
                         first_started.set()
                     else:
@@ -643,12 +675,48 @@ class ApplicationConfigurationTests(unittest.TestCase):
             "GIGAAM_API_KEY": "gigaam-key",
             "INFERENCE_API_URL": "https://inference.example.test",
             "INFERENCE_API_KEY": "inference-key",
+            "SMART_TRANSCRIPTION_SCHEDULING": "false",
         }
-        with patch.dict(os.environ, environment, clear=False):
+        with patch.dict(os.environ, environment, clear=True):
             main()
 
         builder.token.return_value.concurrent_updates.assert_called_once_with(True)
+        self.assertIsNone(
+            application.bot_data.update.call_args.kwargs["transcription_scheduler"]
+        )
         application.run_webhook.assert_called_once()
+
+    @patch("bot.shutil.which", return_value="/usr/bin/ffmpeg")
+    @patch("bot.resolve_converter", return_value="ffmpeg")
+    @patch("bot.load_dotenv")
+    @patch("bot.OpenAI")
+    @patch("bot.ApplicationBuilder")
+    def test_builds_smart_scheduler_when_enabled(
+        self, application_builder, openai, load_dotenv, resolve_converter, which
+    ) -> None:
+        application = Mock()
+        builder = application_builder.return_value
+        builder.token.return_value.concurrent_updates.return_value.build.return_value = application
+        openai.return_value.models.retrieve.return_value = Mock()
+        environment = {
+            "TELEGRAM_BOT_TOKEN": "token",
+            "ALLOWED_USER_IDS": "123",
+            "WEBHOOK_PUBLIC_BASE_URL": "https://funnel.example.ts.net",
+            "WEBHOOK_PATH": "/hooks/bot/telegram/webhook",
+            "WEBHOOK_SECRET_TOKEN": "secret-token",
+            "GIGAAM_URL": "http://gigaam.example.test",
+            "GIGAAM_API_KEY": "gigaam-key",
+            "INFERENCE_API_URL": "https://inference.example.test",
+            "INFERENCE_API_KEY": "inference-key",
+            "SMART_TRANSCRIPTION_SCHEDULING": "true",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            main()
+
+        self.assertIsInstance(
+            application.bot_data.update.call_args.kwargs["transcription_scheduler"],
+            TranscriptionScheduler,
+        )
 
 
 class UnsupportedMessageTests(unittest.TestCase):
@@ -732,6 +800,171 @@ class TranscribeRecordingTests(unittest.TestCase):
         prepare_wav.assert_called_once()
         self.assertEqual(whisper_transcribe.call_count, 2)
         merge_transcripts.assert_called_once()
+
+    def test_smart_scheduling_starts_second_recording_on_free_gigaam(self) -> None:
+        async def scenario() -> None:
+            scheduler = TranscriptionScheduler()
+            stage_locks = StageLocks()
+            started: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
+            releases = {
+                (recording, model): threading.Event()
+                for recording in ("first", "second")
+                for model in ("whisper-model", "gigaam-model")
+            }
+            loop = asyncio.get_running_loop()
+
+            def transcribe(path, client, model):
+                recording = path.name.split(".", 1)[0]
+                loop.call_soon_threadsafe(started.put_nowait, (recording, model))
+                if not releases[recording, model].wait(timeout=2):
+                    raise TimeoutError("test transcription was not released")
+                return {"text": f"{recording}-{model}"}
+
+            with TemporaryDirectory() as directory:
+                first_source = Path(directory) / "first.ogg"
+                second_source = Path(directory) / "second.ogg"
+                first_source.touch()
+                second_source.touch()
+                with (
+                    patch("bot.prepare_wav"),
+                    patch("bot.whisper_transcribe", side_effect=transcribe),
+                    patch(
+                        "bot.merge_transcripts",
+                        return_value=({"text": "merged"}, "merged"),
+                    ),
+                ):
+                    first = asyncio.create_task(
+                        transcribe_recording(
+                            first_source,
+                            Mock(),
+                            "gigaam-model",
+                            Mock(),
+                            "whisper-model",
+                            "merge-model",
+                            "afconvert",
+                            stage_locks,
+                            scheduler=scheduler,
+                        )
+                    )
+                    self.assertEqual(
+                        await asyncio.wait_for(started.get(), timeout=1),
+                        ("first", "whisper-model"),
+                    )
+                    second = asyncio.create_task(
+                        transcribe_recording(
+                            second_source,
+                            Mock(),
+                            "gigaam-model",
+                            Mock(),
+                            "whisper-model",
+                            "merge-model",
+                            "afconvert",
+                            stage_locks,
+                            scheduler=scheduler,
+                        )
+                    )
+                    self.assertEqual(
+                        await asyncio.wait_for(started.get(), timeout=1),
+                        ("second", "gigaam-model"),
+                    )
+
+                    releases["first", "whisper-model"].set()
+                    await asyncio.sleep(0)
+                    self.assertTrue(started.empty())
+                    releases["second", "gigaam-model"].set()
+
+                    swapped = {
+                        await asyncio.wait_for(started.get(), timeout=1),
+                        await asyncio.wait_for(started.get(), timeout=1),
+                    }
+                    self.assertEqual(
+                        swapped,
+                        {
+                            ("first", "gigaam-model"),
+                            ("second", "whisper-model"),
+                        },
+                    )
+                    releases["first", "gigaam-model"].set()
+                    releases["second", "whisper-model"].set()
+                    self.assertEqual(
+                        await asyncio.wait_for(
+                            asyncio.gather(first, second), timeout=2
+                        ),
+                        ["merged", "merged"],
+                    )
+
+        asyncio.run(scenario())
+
+    @patch("bot.merge_transcripts", return_value=({"text": "merged"}, "merged"))
+    @patch(
+        "bot.whisper_transcribe",
+        side_effect=[{"text": "whisper"}, {"text": "gigaam"}],
+    )
+    @patch("bot.prepare_wav")
+    def test_smart_scheduling_reports_actual_engine_statuses(
+        self, prepare_wav, whisper_transcribe, merge_transcripts
+    ) -> None:
+        statuses = []
+
+        async def progress(status: str) -> None:
+            statuses.append(status)
+
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / "audio.ogg"
+            source.touch()
+            result = asyncio.run(
+                transcribe_recording(
+                    source,
+                    Mock(),
+                    "gigaam-model",
+                    Mock(),
+                    "whisper-model",
+                    "merge-model",
+                    "afconvert",
+                    StageLocks(),
+                    progress=progress,
+                    scheduler=TranscriptionScheduler(),
+                )
+            )
+
+        self.assertEqual(result, "merged")
+        self.assertEqual(
+            statuses,
+            [
+                PREPARING_STATUS,
+                WHISPER_TRANSCRIPTION_STATUS,
+                GIGAAM_TRANSCRIPTION_STATUS,
+                MERGING_STATUS,
+            ],
+        )
+
+    @patch("bot.whisper_transcribe", side_effect=OSError("provider failed"))
+    @patch("bot.prepare_wav")
+    def test_smart_scheduling_stops_after_first_asr_failure(
+        self, prepare_wav, whisper_transcribe
+    ) -> None:
+        scheduler = TranscriptionScheduler()
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / "audio.ogg"
+            source.touch()
+            with self.assertRaisesRegex(
+                TranscriptionError, "primary provider could not transcribe"
+            ):
+                asyncio.run(
+                    transcribe_recording(
+                        source,
+                        Mock(),
+                        "gigaam-model",
+                        Mock(),
+                        "whisper-model",
+                        "merge-model",
+                        "afconvert",
+                        StageLocks(),
+                        scheduler=scheduler,
+                    )
+                )
+
+        whisper_transcribe.assert_called_once()
 
     @patch("bot.prepare_wav", side_effect=OSError("unsupported input"))
     def test_reports_conversion_failure(self, prepare_wav) -> None:
