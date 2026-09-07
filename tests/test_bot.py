@@ -447,7 +447,16 @@ class TranscriptDeliveryTests(unittest.TestCase):
 
 
 class HandleAudioTests(unittest.TestCase):
-    def audio_request(self, source: Path, status_result):
+    def audio_request(
+        self,
+        source: Path,
+        status_result,
+        *,
+        user_id: int = 123,
+        chat_id: int = 123,
+        message_id: int = 456,
+        bot=None,
+    ):
         telegram_file = Mock()
         telegram_file.download_to_drive = AsyncMock(
             side_effect=lambda custom_path: Path(custom_path).touch()
@@ -455,8 +464,8 @@ class HandleAudioTests(unittest.TestCase):
         attachment = Mock(file_name="memo.ogg")
         attachment.get_file = AsyncMock(return_value=telegram_file)
         message = Mock(
-            chat_id=123,
-            message_id=456,
+            chat_id=chat_id,
+            message_id=message_id,
             message_thread_id=None,
             voice=attachment,
             audio=None,
@@ -466,11 +475,12 @@ class HandleAudioTests(unittest.TestCase):
             message.reply_text = AsyncMock(side_effect=status_result)
         else:
             message.reply_text = AsyncMock(return_value=status_result)
-        update = Mock(effective_message=message, effective_user=Mock(id=123))
-        bot = Mock(_post=AsyncMock())
+        update = Mock(effective_message=message, effective_user=Mock(id=user_id))
+        if bot is None:
+            bot = Mock(_post=AsyncMock())
         context = Mock(bot=bot)
         context.application.bot_data = {
-            "allowed_user_ids": {123},
+            "allowed_user_ids": {user_id},
             "stage_locks": StageLocks(),
             "gigaam_client": Mock(),
             "gigaam_model": "gigaam-model",
@@ -647,6 +657,83 @@ class HandleAudioTests(unittest.TestCase):
                 finally:
                     release.set()
                 await asyncio.gather(first_task, second_task)
+
+        asyncio.run(scenario())
+        self.assertEqual(transcribe_recording.await_count, 2)
+
+    @patch("bot.transcribe_recording")
+    @patch("bot.recording_paths")
+    def test_two_allowed_users_process_recordings_concurrently_and_reply_to_their_own_chats(
+        self, recording_paths, transcribe_recording
+    ) -> None:
+        async def scenario() -> None:
+            with TemporaryDirectory() as directory:
+                first_source = Path(directory) / "first.ogg"
+                second_source = Path(directory) / "second.ogg"
+                first_status = Mock(chat_id=10001, message_id=1010)
+                first_status.edit_text = AsyncMock()
+                second_status = Mock(chat_id=20002, message_id=2010)
+                second_status.edit_text = AsyncMock()
+                bot = Mock(_post=AsyncMock())
+                first_update, first_context, _, _, first_artifacts = self.audio_request(
+                    first_source,
+                    first_status,
+                    user_id=101,
+                    chat_id=10001,
+                    message_id=10,
+                    bot=bot,
+                )
+                second_update, second_context, _, _, second_artifacts = self.audio_request(
+                    second_source,
+                    second_status,
+                    user_id=202,
+                    chat_id=20002,
+                    message_id=10,
+                    bot=bot,
+                )
+                first_context.application.bot_data["allowed_user_ids"] = {101, 202}
+                second_context.application.bot_data = first_context.application.bot_data
+                recording_paths.side_effect = [
+                    (first_source, first_artifacts),
+                    (second_source, second_artifacts),
+                ]
+
+                first_started = asyncio.Event()
+                second_started = asyncio.Event()
+                release = asyncio.Event()
+
+                async def transcribe(source, *args, **kwargs):
+                    if source == first_source:
+                        first_started.set()
+                    else:
+                        second_started.set()
+                    await release.wait()
+                    return f"transcript for {source.stem}"
+
+                transcribe_recording.side_effect = transcribe
+                first_task = asyncio.create_task(handle_audio(first_update, first_context))
+                await first_started.wait()
+                second_task = asyncio.create_task(handle_audio(second_update, second_context))
+                try:
+                    await asyncio.wait_for(second_started.wait(), timeout=1)
+                finally:
+                    release.set()
+                await asyncio.gather(first_task, second_task)
+
+                deliveries = {
+                    call.kwargs["data"]["chat_id"]: (
+                        call.kwargs["data"]["message_id"],
+                        call.kwargs["data"]["rich_message"]["blocks"][0]["text"],
+                    )
+                    for call in bot._post.await_args_list
+                }
+                self.assertEqual(
+                    deliveries,
+                    {
+                        10001: (1010, "transcript for first"),
+                        20002: (2010, "transcript for second"),
+                    },
+                )
 
         asyncio.run(scenario())
         self.assertEqual(transcribe_recording.await_count, 2)
