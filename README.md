@@ -50,7 +50,12 @@ independent capacity. In that mode, concurrent recordings can start with whichev
 is available, but each recording still uses only one ASR at a time and completes both before
 merge. The setting defaults to `false`; its value must be `true` or `false`.
 
-All configuration, including API URLs and tokens, is in `.env`. Start by copying `.env.example`.
+All configuration, including API URLs and tokens, is in `.env`. Create it from the example and
+then configure its values:
+
+```sh
+cp .env.example .env
+```
 
 ## Webhook through Tailscale Funnel
 
@@ -96,22 +101,6 @@ image locally. By default, Compose uses `ghcr.io/akolotov/vorec-telegram-bot:lat
 on each start. Set `VOREC_BOT_IMAGE` in the shell or `.env` to run a specific published tag instead.
 To run a local build, use `VOREC_BOT_IMAGE=vorec-telegram-bot:local` and
 `VOREC_BOT_PULL_POLICY=never`.
-
-## First setup
-
-In a new project directory, create the local Python 3.12 environment and install the
-dependencies:
-
-```sh
-python3.12 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
-cp .env.example .env
-```
-
-Configure `.env` with the Telegram token, allowed user IDs, API credentials, and unique webhook
-settings. For a second deployment, use a different `TELEGRAM_BOT_TOKEN`,
-`COMPOSE_PROJECT_NAME`, `WEBHOOK_DOCKER_ALIAS`, and matching `WEBHOOK_PATH`. Both deployments
-may use the same inference providers.
 
 ## Persistent data
 
