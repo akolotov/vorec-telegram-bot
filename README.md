@@ -90,9 +90,6 @@ keep containers from different checkouts separate. A second deployment needs a d
 
 ## Docker build
 
-`requirements.txt` contains the bot runtime dependencies, including
-`python-telegram-bot[webhooks]` for the HTTP webhook server.
-
 GitHub Actions builds and publishes the Linux image to GitHub Container Registry after changes
 are merged into `main` and when version tags are pushed. `docker compose up -d` does not build an
 image locally. By default, Compose uses `ghcr.io/akolotov/vorec-telegram-bot:latest` and pulls it
