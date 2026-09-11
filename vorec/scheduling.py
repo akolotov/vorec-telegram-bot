@@ -13,8 +13,8 @@ from enum import Enum, auto
 class TranscriptionResource(Enum):
     """A single-capacity resource used by the transcription pipeline."""
 
-    INFERENCE = "inference"
-    GIGAAM = "gigaam"
+    PRIMARY = "primary"
+    SECONDARY = "secondary"
 
 
 class _WaiterState(Enum):

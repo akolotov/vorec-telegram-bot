@@ -73,7 +73,7 @@ def response_dict(response: Any) -> dict:
     return response.model_dump(mode="json")
 
 
-def whisper_transcribe(wav_path: Path, client: OpenAI, model: str) -> dict:
+def transcribe_audio(wav_path: Path, client: OpenAI, model: str) -> dict:
     with wav_path.open("rb") as audio:
         response = client.audio.transcriptions.create(
             model=model, file=audio, language="ru", response_format="verbose_json"
@@ -82,11 +82,11 @@ def whisper_transcribe(wav_path: Path, client: OpenAI, model: str) -> dict:
 
 
 def merge_transcripts(
-    primary_text: str, gigaam_text: str, client: OpenAI, model: str
+    primary_text: str, secondary_text: str, client: OpenAI, model: str
 ) -> tuple[dict, str]:
     content = (
         f"{MERGE_PROMPT}\n\n<TRANSCRIPT_A>\n{primary_text}\n</TRANSCRIPT_A>"
-        f"\n\n<TRANSCRIPT_B>\n{gigaam_text}\n</TRANSCRIPT_B>"
+        f"\n\n<TRANSCRIPT_B>\n{secondary_text}\n</TRANSCRIPT_B>"
     )
     response = client.chat.completions.create(
         model=model,

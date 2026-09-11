@@ -4,8 +4,8 @@ import unittest
 from vorec.scheduling import TranscriptionResource, TranscriptionScheduler
 
 
-INFERENCE = TranscriptionResource.INFERENCE
-GIGAAM = TranscriptionResource.GIGAAM
+PRIMARY = TranscriptionResource.PRIMARY
+SECONDARY = TranscriptionResource.SECONDARY
 
 
 class TranscriptionSchedulerTests(unittest.TestCase):
@@ -16,11 +16,11 @@ class TranscriptionSchedulerTests(unittest.TestCase):
             releases = {
                 (recording, resource): asyncio.Event()
                 for recording in ("A", "B")
-                for resource in (INFERENCE, GIGAAM)
+                for resource in (PRIMARY, SECONDARY)
             }
 
             async def recording(name: str) -> None:
-                remaining = (INFERENCE, GIGAAM)
+                remaining = (PRIMARY, SECONDARY)
                 for _ in range(2):
                     async with scheduler.reserve(remaining) as resource:
                         await started.put((name, resource))
@@ -28,20 +28,20 @@ class TranscriptionSchedulerTests(unittest.TestCase):
                     remaining = tuple(item for item in remaining if item is not resource)
 
             first = asyncio.create_task(recording("A"))
-            self.assertEqual(await started.get(), ("A", INFERENCE))
+            self.assertEqual(await started.get(), ("A", PRIMARY))
             second = asyncio.create_task(recording("B"))
-            self.assertEqual(await started.get(), ("B", GIGAAM))
+            self.assertEqual(await started.get(), ("B", SECONDARY))
 
-            releases["A", INFERENCE].set()
+            releases["A", PRIMARY].set()
             await asyncio.sleep(0)
             self.assertTrue(started.empty())
 
-            releases["B", GIGAAM].set()
+            releases["B", SECONDARY].set()
             swapped = {await started.get(), await started.get()}
-            self.assertEqual(swapped, {("A", GIGAAM), ("B", INFERENCE)})
+            self.assertEqual(swapped, {("A", SECONDARY), ("B", PRIMARY)})
 
-            releases["A", GIGAAM].set()
-            releases["B", INFERENCE].set()
+            releases["A", SECONDARY].set()
+            releases["B", PRIMARY].set()
             await asyncio.wait_for(asyncio.gather(first, second), timeout=1)
 
         asyncio.run(scenario())
@@ -50,12 +50,15 @@ class TranscriptionSchedulerTests(unittest.TestCase):
         async def scenario() -> None:
             scheduler = TranscriptionScheduler()
             entered: asyncio.Queue[tuple[str, TranscriptionResource]] = asyncio.Queue()
-            releases = {name: asyncio.Event() for name in ("giga", "flexible", "inference")}
+            releases = {
+                name: asyncio.Event()
+                for name in ("secondary", "flexible", "primary")
+            }
 
-            inference_context = scheduler.reserve((INFERENCE,))
-            gigaam_context = scheduler.reserve((GIGAAM,))
-            await inference_context.__aenter__()
-            await gigaam_context.__aenter__()
+            primary_context = scheduler.reserve((PRIMARY,))
+            secondary_context = scheduler.reserve((SECONDARY,))
+            await primary_context.__aenter__()
+            await secondary_context.__aenter__()
 
             async def request(
                 name: str, choices: tuple[TranscriptionResource, ...]
@@ -64,24 +67,24 @@ class TranscriptionSchedulerTests(unittest.TestCase):
                     await entered.put((name, resource))
                     await releases[name].wait()
 
-            oldest = asyncio.create_task(request("giga", (GIGAAM,)))
+            oldest = asyncio.create_task(request("secondary", (SECONDARY,)))
             flexible = asyncio.create_task(
-                request("flexible", (INFERENCE, GIGAAM))
+                request("flexible", (PRIMARY, SECONDARY))
             )
-            inference = asyncio.create_task(request("inference", (INFERENCE,)))
+            primary = asyncio.create_task(request("primary", (PRIMARY,)))
             await asyncio.sleep(0)
 
-            await inference_context.__aexit__(None, None, None)
-            self.assertEqual(await entered.get(), ("flexible", INFERENCE))
-            await gigaam_context.__aexit__(None, None, None)
-            self.assertEqual(await entered.get(), ("giga", GIGAAM))
+            await primary_context.__aexit__(None, None, None)
+            self.assertEqual(await entered.get(), ("flexible", PRIMARY))
+            await secondary_context.__aexit__(None, None, None)
+            self.assertEqual(await entered.get(), ("secondary", SECONDARY))
 
             releases["flexible"].set()
-            self.assertEqual(await entered.get(), ("inference", INFERENCE))
-            releases["giga"].set()
-            releases["inference"].set()
+            self.assertEqual(await entered.get(), ("primary", PRIMARY))
+            releases["secondary"].set()
+            releases["primary"].set()
             await asyncio.wait_for(
-                asyncio.gather(oldest, flexible, inference), timeout=1
+                asyncio.gather(oldest, flexible, primary), timeout=1
             )
 
         asyncio.run(scenario())
@@ -93,12 +96,12 @@ class TranscriptionSchedulerTests(unittest.TestCase):
             next_entered = asyncio.Event()
 
             async def owner() -> None:
-                async with scheduler.reserve((INFERENCE,)):
+                async with scheduler.reserve((PRIMARY,)):
                     owner_entered.set()
                     await asyncio.Event().wait()
 
             async def successor() -> None:
-                async with scheduler.reserve((INFERENCE,)):
+                async with scheduler.reserve((PRIMARY,)):
                     next_entered.set()
 
             owner_task = asyncio.create_task(owner())
@@ -114,10 +117,10 @@ class TranscriptionSchedulerTests(unittest.TestCase):
         asyncio.run(scenario())
 
     def test_cancellation_after_flexible_assignment_returns_capacity(self) -> None:
-        asyncio.run(self._cancel_during_handoff((INFERENCE, GIGAAM), INFERENCE))
+        asyncio.run(self._cancel_during_handoff((PRIMARY, SECONDARY), PRIMARY))
 
     def test_cancellation_after_fixed_assignment_returns_capacity(self) -> None:
-        asyncio.run(self._cancel_during_handoff((GIGAAM,), GIGAAM))
+        asyncio.run(self._cancel_during_handoff((SECONDARY,), SECONDARY))
 
     async def _cancel_during_handoff(
         self,
@@ -137,7 +140,7 @@ class TranscriptionSchedulerTests(unittest.TestCase):
 
         holders = [asyncio.create_task(hold(released_resource))]
         other_resource = (
-            GIGAAM if released_resource is INFERENCE else INFERENCE
+            SECONDARY if released_resource is PRIMARY else PRIMARY
         )
         if other_resource in choices:
             other_started = asyncio.Event()

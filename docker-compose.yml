@@ -7,6 +7,8 @@ services:
     environment:
       INFERENCE_API_URL: ${INFERENCE_API_URL}
       INFERENCE_API_KEY: ${INFERENCE_API_KEY}
+      SECONDARY_INFERENCE_API_URL: ${SECONDARY_INFERENCE_API_URL}
+      SECONDARY_INFERENCE_API_KEY: ${SECONDARY_INFERENCE_API_KEY}
     restart: unless-stopped
     volumes:
       - ./data:/app/data

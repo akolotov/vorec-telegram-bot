@@ -5,7 +5,7 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 
 import httpx
 from bot import (
@@ -13,9 +13,10 @@ from bot import (
     DELIVERY_FAILED_TEXT,
     DELIVERY_UNCONFIRMED_TEXT,
     FIRST_TRANSCRIPT_STATUS,
-    GIGAAM_TRANSCRIPTION_STATUS,
     MERGING_STATUS,
     PREPARING_STATUS,
+    PRIMARY_TRANSCRIPTION_STATUS,
+    SECONDARY_TRANSCRIPTION_STATUS,
     SECOND_TRANSCRIPT_STATUS,
     StageLocks,
     TranscriptionError,
@@ -23,7 +24,6 @@ from bot import (
     WAITING_FOR_FIRST_TRANSCRIPT_STATUS,
     WAITING_FOR_MERGE_STATUS,
     WAITING_FOR_PREPARATION_STATUS,
-    WHISPER_TRANSCRIPTION_STATUS,
     allowed_user_ids,
     boolean_env,
     deliver_transcript,
@@ -482,10 +482,10 @@ class HandleAudioTests(unittest.TestCase):
         context.application.bot_data = {
             "allowed_user_ids": {user_id},
             "stage_locks": StageLocks(),
-            "gigaam_client": Mock(),
-            "gigaam_model": "gigaam-model",
-            "inference_client": Mock(),
+            "primary_inference_client": Mock(),
             "primary_transcription_model": "whisper-model",
+            "secondary_inference_client": Mock(),
+            "secondary_transcription_model": "secondary-model",
             "merge_model": "merge-model",
             "converter": "ffmpeg",
             "transcription_scheduler": None,
@@ -751,25 +751,45 @@ class ApplicationConfigurationTests(unittest.TestCase):
         application = Mock()
         builder = application_builder.return_value
         builder.token.return_value.concurrent_updates.return_value.build.return_value = application
-        openai.return_value.models.retrieve.return_value = Mock()
         environment = {
             "TELEGRAM_BOT_TOKEN": "token",
             "ALLOWED_USER_IDS": "123",
             "WEBHOOK_PUBLIC_BASE_URL": "https://funnel.example.ts.net",
             "WEBHOOK_PATH": "/hooks/bot/telegram/webhook",
             "WEBHOOK_SECRET_TOKEN": "secret-token",
-            "GIGAAM_URL": "http://gigaam.example.test",
-            "GIGAAM_API_KEY": "gigaam-key",
             "INFERENCE_API_URL": "https://inference.example.test",
             "INFERENCE_API_KEY": "inference-key",
+            "SECONDARY_INFERENCE_API_URL": "https://secondary.example.test",
+            "SECONDARY_INFERENCE_API_KEY": "secondary-key",
             "SMART_TRANSCRIPTION_SCHEDULING": "false",
         }
         with patch.dict(os.environ, environment, clear=True):
             main()
 
+        openai.assert_has_calls(
+            [
+                call(
+                    base_url="https://secondary.example.test",
+                    api_key="secondary-key",
+                    timeout=600,
+                ),
+                call(
+                    base_url="https://inference.example.test",
+                    api_key="inference-key",
+                    timeout=600,
+                ),
+            ],
+            any_order=True,
+        )
         builder.token.return_value.concurrent_updates.assert_called_once_with(True)
         self.assertIsNone(
             application.bot_data.update.call_args.kwargs["transcription_scheduler"]
+        )
+        self.assertEqual(
+            application.bot_data.update.call_args.kwargs[
+                "secondary_transcription_model"
+            ],
+            "whisper-podlodka-turbo-mlx",
         )
         application.run_webhook.assert_called_once()
 
@@ -784,17 +804,16 @@ class ApplicationConfigurationTests(unittest.TestCase):
         application = Mock()
         builder = application_builder.return_value
         builder.token.return_value.concurrent_updates.return_value.build.return_value = application
-        openai.return_value.models.retrieve.return_value = Mock()
         environment = {
             "TELEGRAM_BOT_TOKEN": "token",
             "ALLOWED_USER_IDS": "123",
             "WEBHOOK_PUBLIC_BASE_URL": "https://funnel.example.ts.net",
             "WEBHOOK_PATH": "/hooks/bot/telegram/webhook",
             "WEBHOOK_SECRET_TOKEN": "secret-token",
-            "GIGAAM_URL": "http://gigaam.example.test",
-            "GIGAAM_API_KEY": "gigaam-key",
             "INFERENCE_API_URL": "https://inference.example.test",
             "INFERENCE_API_KEY": "inference-key",
+            "SECONDARY_INFERENCE_API_URL": "https://secondary.example.test",
+            "SECONDARY_INFERENCE_API_KEY": "secondary-key",
             "SMART_TRANSCRIPTION_SCHEDULING": "true",
         }
         with patch.dict(os.environ, environment, clear=True):
@@ -837,12 +856,12 @@ class UnsupportedMessageTests(unittest.TestCase):
 class TranscribeRecordingTests(unittest.TestCase):
     @patch("bot.merge_transcripts", return_value=({"text": "merged text"}, " merged text "))
     @patch(
-        "bot.whisper_transcribe",
-        side_effect=[{"text": "whisper text"}, {"text": "gigaam text"}],
+        "bot.transcribe_audio",
+        side_effect=[{"text": "primary text"}, {"text": "secondary text"}],
     )
     @patch("bot.prepare_wav")
     def test_runs_both_engines_and_returns_merged_text(
-        self, prepare_wav, whisper_transcribe, merge_transcripts
+        self, prepare_wav, transcribe_audio, merge_transcripts
     ) -> None:
         stages = []
 
@@ -857,9 +876,9 @@ class TranscribeRecordingTests(unittest.TestCase):
                 transcribe_recording(
                     source,
                     Mock(),
-                    "gigaam-model",
+                    "primary-model",
                     Mock(),
-                    "whisper-model",
+                    "secondary-model",
                     "merge-model",
                     "afconvert",
                     StageLocks(),
@@ -870,7 +889,7 @@ class TranscribeRecordingTests(unittest.TestCase):
 
             self.assertEqual(
                 {path.name for path in artifacts_directory.iterdir()},
-                {"whisper.json", "whisper.txt", "gigaam.json", "gigaam.txt", "merged.json", "merged.txt"},
+                {"primary.json", "primary.txt", "secondary.json", "secondary.txt", "merged.json", "merged.txt"},
             )
             self.assertEqual((artifacts_directory / "merged.txt").read_text(), "merged text\n")
 
@@ -885,10 +904,10 @@ class TranscribeRecordingTests(unittest.TestCase):
             ],
         )
         prepare_wav.assert_called_once()
-        self.assertEqual(whisper_transcribe.call_count, 2)
+        self.assertEqual(transcribe_audio.call_count, 2)
         merge_transcripts.assert_called_once()
 
-    def test_smart_scheduling_starts_second_recording_on_free_gigaam(self) -> None:
+    def test_smart_scheduling_starts_second_recording_on_free_secondary(self) -> None:
         async def scenario() -> None:
             scheduler = TranscriptionScheduler()
             stage_locks = StageLocks()
@@ -896,7 +915,7 @@ class TranscribeRecordingTests(unittest.TestCase):
             releases = {
                 (recording, model): threading.Event()
                 for recording in ("first", "second")
-                for model in ("whisper-model", "gigaam-model")
+                for model in ("primary-model", "secondary-model")
             }
             loop = asyncio.get_running_loop()
 
@@ -914,7 +933,7 @@ class TranscribeRecordingTests(unittest.TestCase):
                 second_source.touch()
                 with (
                     patch("bot.prepare_wav"),
-                    patch("bot.whisper_transcribe", side_effect=transcribe),
+                    patch("bot.transcribe_audio", side_effect=transcribe),
                     patch(
                         "bot.merge_transcripts",
                         return_value=({"text": "merged"}, "merged"),
@@ -924,9 +943,9 @@ class TranscribeRecordingTests(unittest.TestCase):
                         transcribe_recording(
                             first_source,
                             Mock(),
-                            "gigaam-model",
+                            "primary-model",
                             Mock(),
-                            "whisper-model",
+                            "secondary-model",
                             "merge-model",
                             "afconvert",
                             stage_locks,
@@ -935,15 +954,15 @@ class TranscribeRecordingTests(unittest.TestCase):
                     )
                     self.assertEqual(
                         await asyncio.wait_for(started.get(), timeout=1),
-                        ("first", "whisper-model"),
+                        ("first", "primary-model"),
                     )
                     second = asyncio.create_task(
                         transcribe_recording(
                             second_source,
                             Mock(),
-                            "gigaam-model",
+                            "primary-model",
                             Mock(),
-                            "whisper-model",
+                            "secondary-model",
                             "merge-model",
                             "afconvert",
                             stage_locks,
@@ -952,13 +971,13 @@ class TranscribeRecordingTests(unittest.TestCase):
                     )
                     self.assertEqual(
                         await asyncio.wait_for(started.get(), timeout=1),
-                        ("second", "gigaam-model"),
+                        ("second", "secondary-model"),
                     )
 
-                    releases["first", "whisper-model"].set()
+                    releases["first", "primary-model"].set()
                     await asyncio.sleep(0)
                     self.assertTrue(started.empty())
-                    releases["second", "gigaam-model"].set()
+                    releases["second", "secondary-model"].set()
 
                     swapped = {
                         await asyncio.wait_for(started.get(), timeout=1),
@@ -967,12 +986,12 @@ class TranscribeRecordingTests(unittest.TestCase):
                     self.assertEqual(
                         swapped,
                         {
-                            ("first", "gigaam-model"),
-                            ("second", "whisper-model"),
+                            ("first", "secondary-model"),
+                            ("second", "primary-model"),
                         },
                     )
-                    releases["first", "gigaam-model"].set()
-                    releases["second", "whisper-model"].set()
+                    releases["first", "secondary-model"].set()
+                    releases["second", "primary-model"].set()
                     self.assertEqual(
                         await asyncio.wait_for(
                             asyncio.gather(first, second), timeout=2
@@ -984,12 +1003,12 @@ class TranscribeRecordingTests(unittest.TestCase):
 
     @patch("bot.merge_transcripts", return_value=({"text": "merged"}, "merged"))
     @patch(
-        "bot.whisper_transcribe",
-        side_effect=[{"text": "whisper"}, {"text": "gigaam"}],
+        "bot.transcribe_audio",
+        side_effect=[{"text": "primary"}, {"text": "secondary"}],
     )
     @patch("bot.prepare_wav")
     def test_smart_scheduling_reports_actual_engine_statuses(
-        self, prepare_wav, whisper_transcribe, merge_transcripts
+        self, prepare_wav, transcribe_audio, merge_transcripts
     ) -> None:
         statuses = []
 
@@ -1003,9 +1022,9 @@ class TranscribeRecordingTests(unittest.TestCase):
                 transcribe_recording(
                     source,
                     Mock(),
-                    "gigaam-model",
+                    "primary-model",
                     Mock(),
-                    "whisper-model",
+                    "secondary-model",
                     "merge-model",
                     "afconvert",
                     StageLocks(),
@@ -1019,16 +1038,16 @@ class TranscribeRecordingTests(unittest.TestCase):
             statuses,
             [
                 PREPARING_STATUS,
-                WHISPER_TRANSCRIPTION_STATUS,
-                GIGAAM_TRANSCRIPTION_STATUS,
+                PRIMARY_TRANSCRIPTION_STATUS,
+                SECONDARY_TRANSCRIPTION_STATUS,
                 MERGING_STATUS,
             ],
         )
 
-    @patch("bot.whisper_transcribe", side_effect=OSError("provider failed"))
+    @patch("bot.transcribe_audio", side_effect=OSError("provider failed"))
     @patch("bot.prepare_wav")
     def test_smart_scheduling_stops_after_first_asr_failure(
-        self, prepare_wav, whisper_transcribe
+        self, prepare_wav, transcribe_audio
     ) -> None:
         scheduler = TranscriptionScheduler()
         with TemporaryDirectory() as directory:
@@ -1041,9 +1060,9 @@ class TranscribeRecordingTests(unittest.TestCase):
                     transcribe_recording(
                         source,
                         Mock(),
-                        "gigaam-model",
+                        "primary-model",
                         Mock(),
-                        "whisper-model",
+                        "secondary-model",
                         "merge-model",
                         "afconvert",
                         StageLocks(),
@@ -1051,7 +1070,7 @@ class TranscribeRecordingTests(unittest.TestCase):
                     )
                 )
 
-        whisper_transcribe.assert_called_once()
+        transcribe_audio.assert_called_once()
 
     @patch("bot.prepare_wav", side_effect=OSError("unsupported input"))
     def test_reports_conversion_failure(self, prepare_wav) -> None:
@@ -1063,9 +1082,9 @@ class TranscribeRecordingTests(unittest.TestCase):
                     transcribe_recording(
                         source,
                         Mock(),
-                        "gigaam-model",
+                        "primary-model",
                         Mock(),
-                        "whisper-model",
+                        "secondary-model",
                         "merge-model",
                         "afconvert",
                         StageLocks(),
@@ -1073,10 +1092,10 @@ class TranscribeRecordingTests(unittest.TestCase):
                 )
 
     @patch("bot.merge_transcripts", return_value=({}, "text"))
-    @patch("bot.whisper_transcribe", return_value={"text": "text"})
+    @patch("bot.transcribe_audio", return_value={"text": "text"})
     @patch("bot.prepare_wav")
     def test_uses_separate_output_when_source_is_wav(
-        self, prepare_wav, whisper_transcribe, merge_transcripts
+        self, prepare_wav, transcribe_audio, merge_transcripts
     ) -> None:
         with TemporaryDirectory() as directory:
             source = Path(directory) / "audio.wav"
@@ -1085,9 +1104,9 @@ class TranscribeRecordingTests(unittest.TestCase):
                 transcribe_recording(
                     source,
                     Mock(),
-                    "gigaam-model",
+                    "primary-model",
                     Mock(),
-                    "whisper-model",
+                    "secondary-model",
                     "merge-model",
                     "afconvert",
                     StageLocks(),
@@ -1149,7 +1168,7 @@ class StageLockTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
-    def test_omlx_lock_serializes_whisper_and_merge(self) -> None:
+    def test_primary_lock_serializes_transcription_and_merge(self) -> None:
         async def scenario() -> None:
             stage_locks = StageLocks()
             order = []
@@ -1157,29 +1176,29 @@ class StageLockTests(unittest.TestCase):
             release_first = threading.Event()
             loop = asyncio.get_running_loop()
 
-            def whisper() -> str:
-                order.append("whisper-start")
+            def transcribe() -> str:
+                order.append("transcribe-start")
                 loop.call_soon_threadsafe(first_started.set)
                 release_first.wait()
-                order.append("whisper-finish")
-                return "whisper"
+                order.append("transcribe-finish")
+                return "transcript"
 
             def merge() -> str:
                 order.append("merge-start")
                 return "merge"
 
-            whisper_task = asyncio.create_task(
+            transcription_task = asyncio.create_task(
                 run_serial_stage(
-                    stage_locks.omlx,
+                    stage_locks.primary,
                     WAITING_FOR_FIRST_TRANSCRIPT_STATUS,
                     FIRST_TRANSCRIPT_STATUS,
-                    whisper,
+                    transcribe,
                 )
             )
             await first_started.wait()
             merge_task = asyncio.create_task(
                 run_serial_stage(
-                    stage_locks.omlx,
+                    stage_locks.primary,
                     WAITING_FOR_MERGE_STATUS,
                     MERGING_STATUS,
                     merge,
@@ -1187,14 +1206,14 @@ class StageLockTests(unittest.TestCase):
             )
             try:
                 await asyncio.sleep(0)
-                self.assertEqual(order, ["whisper-start"])
+                self.assertEqual(order, ["transcribe-start"])
             finally:
                 release_first.set()
-            self.assertEqual(await whisper_task, "whisper")
+            self.assertEqual(await transcription_task, "transcript")
             self.assertEqual(await merge_task, "merge")
             self.assertEqual(
                 order,
-                ["whisper-start", "whisper-finish", "merge-start"],
+                ["transcribe-start", "transcribe-finish", "merge-start"],
             )
 
         asyncio.run(scenario())
@@ -1202,7 +1221,7 @@ class StageLockTests(unittest.TestCase):
     def test_different_stage_locks_can_run_concurrently(self) -> None:
         async def scenario() -> None:
             stage_locks = StageLocks()
-            started = {"wav": asyncio.Event(), "gigaam": asyncio.Event()}
+            started = {"wav": asyncio.Event(), "secondary": asyncio.Event()}
             release = threading.Event()
             loop = asyncio.get_running_loop()
 
@@ -1220,25 +1239,25 @@ class StageLockTests(unittest.TestCase):
                     "wav",
                 )
             )
-            gigaam_task = asyncio.create_task(
+            secondary_task = asyncio.create_task(
                 run_serial_stage(
-                    stage_locks.gigaam,
+                    stage_locks.secondary,
                     WAITING_FOR_PREPARATION_STATUS,
                     SECOND_TRANSCRIPT_STATUS,
                     operation,
-                    "gigaam",
+                    "secondary",
                 )
             )
 
             try:
                 await asyncio.wait_for(
-                    asyncio.gather(started["wav"].wait(), started["gigaam"].wait()),
+                    asyncio.gather(started["wav"].wait(), started["secondary"].wait()),
                     timeout=1,
                 )
             finally:
                 release.set()
             self.assertEqual(await wav_task, "wav")
-            self.assertEqual(await gigaam_task, "gigaam")
+            self.assertEqual(await secondary_task, "secondary")
 
         asyncio.run(scenario())
 
