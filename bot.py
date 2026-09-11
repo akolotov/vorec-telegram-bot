@@ -28,7 +28,7 @@ from vorec.audio import (
     merge_transcripts,
     prepare_wav,
     resolve_converter,
-    whisper_transcribe,
+    transcribe_audio,
 )
 from vorec.scheduling import TranscriptionResource, TranscriptionScheduler
 
@@ -36,7 +36,7 @@ from vorec.scheduling import TranscriptionResource, TranscriptionScheduler
 ENV_FILE = Path(".env")
 DEFAULT_PRIMARY_TRANSCRIPTION_MODEL = "whisper-large-v3-turbo-asr-fp16"
 DEFAULT_MERGE_MODEL = "gemma-4-26b-a4b-it-4bit"
-DEFAULT_GIGAAM_MODEL = "whisper-1"
+DEFAULT_SECONDARY_TRANSCRIPTION_MODEL = "whisper-podlodka-turbo-mlx"
 DEFAULT_CONVERTER = "ffmpeg"
 UNSUPPORTED_MESSAGE_TEXT = "This message type is not supported. Please send audio."
 DOWNLOADING_STATUS = "Downloading audio…"
@@ -49,10 +49,10 @@ WAITING_FOR_FIRST_TRANSCRIPT_STATUS = "Waiting to create the first transcript…
 WAITING_FOR_SECOND_TRANSCRIPT_STATUS = "Waiting to create the second transcript…"
 WAITING_FOR_MERGE_STATUS = "Waiting to merge transcripts…"
 WAITING_FOR_TRANSCRIPTION_PROVIDER_STATUS = "Waiting for a transcription provider…"
-WAITING_FOR_WHISPER_STATUS = "Waiting for Whisper…"
-WAITING_FOR_GIGAAM_STATUS = "Waiting for GigaAM…"
-WHISPER_TRANSCRIPTION_STATUS = "Transcribing with Whisper…"
-GIGAAM_TRANSCRIPTION_STATUS = "Transcribing with GigaAM…"
+WAITING_FOR_PRIMARY_INFERENCE_STATUS = "Waiting for the primary inference provider…"
+WAITING_FOR_SECONDARY_INFERENCE_STATUS = "Waiting for the secondary inference provider…"
+PRIMARY_TRANSCRIPTION_STATUS = "Transcribing with the primary model…"
+SECONDARY_TRANSCRIPTION_STATUS = "Transcribing with the secondary model…"
 DELIVERY_FAILED_TEXT = "The transcript was created, but it could not be delivered."
 DELIVERY_UNCONFIRMED_TEXT = (
     "The transcript was created, but its delivery could not be confirmed."
@@ -79,8 +79,8 @@ class StageLocks:
     """Serialize the bot's use of each blocking transcription resource."""
 
     wav: asyncio.Lock = field(default_factory=asyncio.Lock)
-    gigaam: asyncio.Lock = field(default_factory=asyncio.Lock)
-    omlx: asyncio.Lock = field(default_factory=asyncio.Lock)
+    secondary: asyncio.Lock = field(default_factory=asyncio.Lock)
+    primary: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 def required_env(name: str) -> str:
@@ -335,28 +335,28 @@ async def run_blocking_operation(
 async def run_scheduled_asr(
     resource: TranscriptionResource,
     wav_path: Path,
-    gigaam_client: OpenAI,
-    gigaam_model: str,
-    inference_client: OpenAI,
+    primary_inference_client: OpenAI,
     primary_transcription_model: str,
+    secondary_inference_client: OpenAI,
+    secondary_transcription_model: str,
     artifacts_directory: Path | None,
     progress: Callable[[str], Awaitable[None]] | None,
 ) -> str:
     """Run the ASR operation selected by the smart scheduler."""
-    if resource is TranscriptionResource.INFERENCE:
-        active_status = WHISPER_TRANSCRIPTION_STATUS
-        client = inference_client
+    if resource is TranscriptionResource.PRIMARY:
+        active_status = PRIMARY_TRANSCRIPTION_STATUS
+        client = primary_inference_client
         model = primary_transcription_model
-        artifact_name = "whisper"
-        log_name = "Whisper"
+        artifact_name = "primary"
+        log_name = "Primary"
         error_prefix = "The primary provider could not transcribe the audio"
     else:
-        active_status = GIGAAM_TRANSCRIPTION_STATUS
-        client = gigaam_client
-        model = gigaam_model
-        artifact_name = "gigaam"
-        log_name = "GigaAM"
-        error_prefix = "GigaAM could not transcribe the audio"
+        active_status = SECONDARY_TRANSCRIPTION_STATUS
+        client = secondary_inference_client
+        model = secondary_transcription_model
+        artifact_name = "secondary"
+        log_name = "Secondary"
+        error_prefix = "The secondary provider could not transcribe the audio"
 
     try:
         if progress is not None:
@@ -364,7 +364,7 @@ async def run_scheduled_asr(
         stage_started = time.monotonic()
         LOGGER.info("Starting %s transcription.", log_name)
         result = await run_blocking_operation(
-            whisper_transcribe, wav_path, client, model
+            transcribe_audio, wav_path, client, model
         )
         text = result.get("text")
         if not isinstance(text, str) or not text.strip():
@@ -385,10 +385,10 @@ async def run_scheduled_asr(
 
 async def transcribe_recording(
     source: Path,
-    gigaam_client: OpenAI,
-    gigaam_model: str,
-    inference_client: OpenAI,
+    primary_inference_client: OpenAI,
     primary_transcription_model: str,
+    secondary_inference_client: OpenAI,
+    secondary_transcription_model: str,
     merge_model: str,
     converter: str,
     stage_locks: StageLocks,
@@ -423,12 +423,12 @@ async def transcribe_recording(
                 stage_started = time.monotonic()
                 LOGGER.info("Starting primary transcription through the inference provider.")
                 primary_result = await run_serial_stage(
-                    stage_locks.omlx,
+                    stage_locks.primary,
                     WAITING_FOR_FIRST_TRANSCRIPT_STATUS,
                     FIRST_TRANSCRIPT_STATUS,
-                    whisper_transcribe,
+                    transcribe_audio,
                     wav_path,
-                    inference_client,
+                    primary_inference_client,
                     primary_transcription_model,
                     progress=progress,
                 )
@@ -437,7 +437,7 @@ async def transcribe_recording(
                     raise ValueError("the service returned empty text")
                 if artifacts_directory is not None:
                     save_transcription_artifact(
-                        artifacts_directory, "whisper", primary_result, primary_text
+                        artifacts_directory, "primary", primary_result, primary_text
                     )
                 LOGGER.info(
                     "Primary transcription completed in %.1f s.",
@@ -450,46 +450,49 @@ async def transcribe_recording(
 
             try:
                 stage_started = time.monotonic()
-                LOGGER.info("Starting GigaAM secondary transcription.")
-                gigaam_result = await run_serial_stage(
-                    stage_locks.gigaam,
+                LOGGER.info("Starting secondary transcription.")
+                secondary_result = await run_serial_stage(
+                    stage_locks.secondary,
                     WAITING_FOR_SECOND_TRANSCRIPT_STATUS,
                     SECOND_TRANSCRIPT_STATUS,
-                    whisper_transcribe,
+                    transcribe_audio,
                     wav_path,
-                    gigaam_client,
-                    gigaam_model,
+                    secondary_inference_client,
+                    secondary_transcription_model,
                     progress=progress,
                 )
-                gigaam_text = gigaam_result.get("text")
-                if not isinstance(gigaam_text, str) or not gigaam_text.strip():
+                secondary_text = secondary_result.get("text")
+                if not isinstance(secondary_text, str) or not secondary_text.strip():
                     raise ValueError("the service returned empty text")
                 if artifacts_directory is not None:
                     save_transcription_artifact(
-                        artifacts_directory, "gigaam", gigaam_result, gigaam_text
+                        artifacts_directory,
+                        "secondary",
+                        secondary_result,
+                        secondary_text,
                     )
                 LOGGER.info(
-                    "GigaAM transcription completed in %.1f s.",
+                    "Secondary transcription completed in %.1f s.",
                     time.monotonic() - stage_started,
                 )
             except (OpenAIError, OSError, ValueError) as error:
                 raise TranscriptionError(
-                    f"GigaAM could not transcribe the audio: {error}"
+                    f"The secondary provider could not transcribe the audio: {error}"
                 ) from error
         else:
             transcripts: dict[TranscriptionResource, str] = {}
             remaining = (
-                TranscriptionResource.INFERENCE,
-                TranscriptionResource.GIGAAM,
+                TranscriptionResource.PRIMARY,
+                TranscriptionResource.SECONDARY,
             )
             for _ in range(2):
                 waiting_status = (
                     WAITING_FOR_TRANSCRIPTION_PROVIDER_STATUS
                     if len(remaining) == 2
                     else (
-                        WAITING_FOR_WHISPER_STATUS
-                        if remaining[0] is TranscriptionResource.INFERENCE
-                        else WAITING_FOR_GIGAAM_STATUS
+                        WAITING_FOR_PRIMARY_INFERENCE_STATUS
+                        if remaining[0] is TranscriptionResource.PRIMARY
+                        else WAITING_FOR_SECONDARY_INFERENCE_STATUS
                     )
                 )
 
@@ -503,30 +506,30 @@ async def transcribe_recording(
                     transcripts[resource] = await run_scheduled_asr(
                         resource,
                         wav_path,
-                        gigaam_client,
-                        gigaam_model,
-                        inference_client,
+                        primary_inference_client,
                         primary_transcription_model,
+                        secondary_inference_client,
+                        secondary_transcription_model,
                         artifacts_directory,
                         progress,
                     )
                 remaining = tuple(item for item in remaining if item is not resource)
 
-            primary_text = transcripts[TranscriptionResource.INFERENCE]
-            gigaam_text = transcripts[TranscriptionResource.GIGAAM]
+            primary_text = transcripts[TranscriptionResource.PRIMARY]
+            secondary_text = transcripts[TranscriptionResource.SECONDARY]
 
         try:
             stage_started = time.monotonic()
             LOGGER.info("Starting transcript merge through the inference provider.")
             if scheduler is None:
                 merged_result, merged_text = await run_serial_stage(
-                    stage_locks.omlx,
+                    stage_locks.primary,
                     WAITING_FOR_MERGE_STATUS,
                     MERGING_STATUS,
                     merge_transcripts,
                     primary_text,
-                    gigaam_text,
-                    inference_client,
+                    secondary_text,
+                    primary_inference_client,
                     merge_model,
                     progress=progress,
                 )
@@ -536,7 +539,7 @@ async def transcribe_recording(
                         await progress(WAITING_FOR_MERGE_STATUS)
 
                 async with scheduler.reserve(
-                    (TranscriptionResource.INFERENCE,),
+                    (TranscriptionResource.PRIMARY,),
                     on_wait=report_merge_waiting,
                 ):
                     if progress is not None:
@@ -544,8 +547,8 @@ async def transcribe_recording(
                     merged_result, merged_text = await run_blocking_operation(
                         merge_transcripts,
                         primary_text,
-                        gigaam_text,
-                        inference_client,
+                        secondary_text,
+                        primary_inference_client,
                         merge_model,
                     )
             if artifacts_directory is not None:
@@ -641,10 +644,10 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         transcript = await transcribe_recording(
             source,
-            context.application.bot_data["gigaam_client"],
-            context.application.bot_data["gigaam_model"],
-            context.application.bot_data["inference_client"],
+            context.application.bot_data["primary_inference_client"],
             context.application.bot_data["primary_transcription_model"],
+            context.application.bot_data["secondary_inference_client"],
+            context.application.bot_data["secondary_transcription_model"],
             context.application.bot_data["merge_model"],
             context.application.bot_data["converter"],
             context.application.bot_data["stage_locks"],
@@ -712,20 +715,16 @@ def main() -> None:
     if not shutil.which(converter):
         raise ConfigurationError(f"Audio converter executable not found: {converter}")
 
-    gigaam_model = os.getenv("GIGAAM_MODEL", DEFAULT_GIGAAM_MODEL)
-    gigaam_client = OpenAI(
-        base_url=required_env("GIGAAM_URL"),
-        api_key=required_env("GIGAAM_API_KEY"),
+    secondary_transcription_model = os.getenv(
+        "SECONDARY_TRANSCRIPTION_MODEL", DEFAULT_SECONDARY_TRANSCRIPTION_MODEL
+    )
+    secondary_inference_client = OpenAI(
+        base_url=required_env("SECONDARY_INFERENCE_API_URL"),
+        api_key=required_env("SECONDARY_INFERENCE_API_KEY"),
         timeout=600,
     )
-    try:
-        gigaam_client.models.retrieve(gigaam_model)
-    except OpenAIError as error:
-        raise ConfigurationError(
-            f"GigaAM server is unavailable or rejected authentication: {error}"
-        ) from error
 
-    inference_client = OpenAI(
+    primary_inference_client = OpenAI(
         base_url=required_env("INFERENCE_API_URL"),
         api_key=required_env("INFERENCE_API_KEY"),
         timeout=600,
@@ -737,12 +736,12 @@ def main() -> None:
     app.bot_data.update(
         allowed_user_ids=user_ids,
         stage_locks=StageLocks(),
-        gigaam_client=gigaam_client,
-        gigaam_model=gigaam_model,
-        inference_client=inference_client,
+        primary_inference_client=primary_inference_client,
         primary_transcription_model=os.getenv(
             "PRIMARY_TRANSCRIPTION_MODEL", DEFAULT_PRIMARY_TRANSCRIPTION_MODEL
         ),
+        secondary_inference_client=secondary_inference_client,
+        secondary_transcription_model=secondary_transcription_model,
         merge_model=os.getenv("MERGE_MODEL", DEFAULT_MERGE_MODEL),
         converter=converter,
         transcription_scheduler=scheduler,
