@@ -32,6 +32,7 @@ from bot import (
     handle_unsupported_message,
     main,
     recording_paths,
+    rich_transcript_blocks,
     run_serial_stage,
     send_rich_transcript_reply,
     transcribe_recording,
@@ -199,6 +200,20 @@ class WebhookConfigurationTests(unittest.TestCase):
 
 
 class RichMessageTests(unittest.TestCase):
+    def test_uses_first_50_characters_as_details_summary(self) -> None:
+        transcript = "a" * 50 + "hidden"
+
+        self.assertEqual(
+            rich_transcript_blocks(transcript),
+            [
+                {
+                    "type": "details",
+                    "summary": "a" * 50,
+                    "blocks": [{"type": "paragraph", "text": transcript}],
+                }
+            ],
+        )
+
     def test_sends_rich_message_as_reply(self) -> None:
         message = Mock(chat_id=123, message_id=456, message_thread_id=None)
         bot = Mock()
@@ -211,7 +226,15 @@ class RichMessageTests(unittest.TestCase):
             data={
                 "chat_id": 123,
                 "rich_message": {
-                    "blocks": [{"type": "paragraph", "text": "verbatim _text_"}],
+                    "blocks": [
+                        {
+                            "type": "details",
+                            "summary": "verbatim _text_",
+                            "blocks": [
+                                {"type": "paragraph", "text": "verbatim _text_"}
+                            ],
+                        }
+                    ],
                     "skip_entity_detection": True,
                 },
                 "reply_parameters": {"message_id": 456},
@@ -232,7 +255,15 @@ class RichMessageTests(unittest.TestCase):
                 "chat_id": 123,
                 "message_id": 789,
                 "rich_message": {
-                    "blocks": [{"type": "paragraph", "text": "final text"}],
+                    "blocks": [
+                        {
+                            "type": "details",
+                            "summary": "final text",
+                            "blocks": [
+                                {"type": "paragraph", "text": "final text"}
+                            ],
+                        }
+                    ],
                     "skip_entity_detection": True,
                 },
             },
@@ -723,7 +754,9 @@ class HandleAudioTests(unittest.TestCase):
                 deliveries = {
                     call.kwargs["data"]["chat_id"]: (
                         call.kwargs["data"]["message_id"],
-                        call.kwargs["data"]["rich_message"]["blocks"][0]["text"],
+                        call.kwargs["data"]["rich_message"]["blocks"][0]["blocks"][0][
+                            "text"
+                        ],
                     )
                     for call in bot._post.await_args_list
                 }
