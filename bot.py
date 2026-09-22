@@ -61,6 +61,7 @@ DELIVERY_RETRY_DELAYS = (1, 2)
 DEFAULT_WEBHOOK_LISTEN = "0.0.0.0"
 DEFAULT_WEBHOOK_PORT = 8080
 DATA_DIRECTORY = Path("data")
+TRANSCRIPT_SUMMARY_LENGTH = 50
 
 LOGGER = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -72,6 +73,17 @@ class ConfigurationError(ValueError):
 
 class TranscriptionError(RuntimeError):
     """A transcription failure with a user-safe English explanation."""
+
+
+def rich_transcript_blocks(transcript: str) -> list[dict[str, object]]:
+    """Return a collapsed Rich Message details block for a transcript."""
+    return [
+        {
+            "type": "details",
+            "summary": transcript[:TRANSCRIPT_SUMMARY_LENGTH],
+            "blocks": [{"type": "paragraph", "text": transcript}],
+        }
+    ]
 
 
 @dataclass
@@ -147,7 +159,7 @@ async def send_rich_transcript_reply(message, bot, transcript: str) -> None:
     data = {
         "chat_id": message.chat_id,
         "rich_message": {
-            "blocks": [{"type": "paragraph", "text": transcript}],
+            "blocks": rich_transcript_blocks(transcript),
             "skip_entity_detection": True,
         },
         "reply_parameters": {"message_id": message.message_id},
@@ -168,7 +180,7 @@ async def edit_rich_transcript_message(status_message, bot, transcript: str) -> 
             "chat_id": status_message.chat_id,
             "message_id": status_message.message_id,
             "rich_message": {
-                "blocks": [{"type": "paragraph", "text": transcript}],
+                "blocks": rich_transcript_blocks(transcript),
                 "skip_entity_detection": True,
             },
         },
