@@ -28,6 +28,7 @@ from vorec.audio import (
     merge_transcripts,
     prepare_wav,
     resolve_converter,
+    summarize_transcript,
     transcribe_audio,
 )
 from vorec.scheduling import TranscriptionResource, TranscriptionScheduler
@@ -44,10 +45,12 @@ PREPARING_STATUS = "Preparing audio…"
 FIRST_TRANSCRIPT_STATUS = "Creating the first transcript…"
 SECOND_TRANSCRIPT_STATUS = "Creating the second transcript…"
 MERGING_STATUS = "Merging transcripts…"
+SUMMARY_STATUS = "Generating summary…"
 WAITING_FOR_PREPARATION_STATUS = "Waiting to prepare audio…"
 WAITING_FOR_FIRST_TRANSCRIPT_STATUS = "Waiting to create the first transcript…"
 WAITING_FOR_SECOND_TRANSCRIPT_STATUS = "Waiting to create the second transcript…"
 WAITING_FOR_MERGE_STATUS = "Waiting to merge transcripts…"
+WAITING_FOR_SUMMARY_STATUS = "Waiting to generate summary…"
 WAITING_FOR_TRANSCRIPTION_PROVIDER_STATUS = "Waiting for a transcription provider…"
 WAITING_FOR_PRIMARY_INFERENCE_STATUS = "Waiting for the primary inference provider…"
 WAITING_FOR_SECONDARY_INFERENCE_STATUS = "Waiting for the secondary inference provider…"
@@ -75,12 +78,12 @@ class TranscriptionError(RuntimeError):
     """A transcription failure with a user-safe English explanation."""
 
 
-def rich_transcript_blocks(transcript: str) -> list[dict[str, object]]:
+def rich_transcript_blocks(transcript: str, summary: str) -> list[dict[str, object]]:
     """Return a collapsed Rich Message details block for a transcript."""
     return [
         {
             "type": "details",
-            "summary": transcript[:TRANSCRIPT_SUMMARY_LENGTH],
+            "summary": summary,
             "blocks": [{"type": "paragraph", "text": transcript}],
         }
     ]
@@ -154,12 +157,14 @@ def webhook_configuration() -> tuple[str, str, str, int, str]:
     )
 
 
-async def send_rich_transcript_reply(message, bot, transcript: str) -> None:
+async def send_rich_transcript_reply(
+    message, bot, transcript: str, summary: str
+) -> None:
     """Send one Rich Message transcript as a reply to the source recording."""
     data = {
         "chat_id": message.chat_id,
         "rich_message": {
-            "blocks": rich_transcript_blocks(transcript),
+            "blocks": rich_transcript_blocks(transcript, summary),
             "skip_entity_detection": True,
         },
         "reply_parameters": {"message_id": message.message_id},
@@ -172,7 +177,9 @@ async def send_rich_transcript_reply(message, bot, transcript: str) -> None:
     LOGGER.info("Sent Rich Message reply with %d characters.", len(transcript))
 
 
-async def edit_rich_transcript_message(status_message, bot, transcript: str) -> None:
+async def edit_rich_transcript_message(
+    status_message, bot, transcript: str, summary: str
+) -> None:
     """Replace a status message with one Rich Message transcript."""
     await bot._post(
         "editMessageText",
@@ -180,7 +187,7 @@ async def edit_rich_transcript_message(status_message, bot, transcript: str) -> 
             "chat_id": status_message.chat_id,
             "message_id": status_message.message_id,
             "rich_message": {
-                "blocks": rich_transcript_blocks(transcript),
+                "blocks": rich_transcript_blocks(transcript, summary),
                 "skip_entity_detection": True,
             },
         },
@@ -259,12 +266,14 @@ async def report_delivery_failure(message, status_message, *, uncertain: bool) -
         LOGGER.warning("Delivery error reply failed (%s).", error.__class__.__name__)
 
 
-async def deliver_transcript(message, status_message, bot, transcript: str) -> None:
+async def deliver_transcript(
+    message, status_message, bot, transcript: str, summary: str
+) -> None:
     """Deliver a completed transcript without reporting delivery as processing failure."""
     if status_message is None:
         try:
             await retry_delivery_request(
-                lambda: send_rich_transcript_reply(message, bot, transcript)
+                lambda: send_rich_transcript_reply(message, bot, transcript, summary)
             )
         except Exception as error:
             LOGGER.exception("Rich Message transcript delivery failed.")
@@ -277,7 +286,9 @@ async def deliver_transcript(message, status_message, bot, transcript: str) -> N
 
     try:
         await retry_delivery_request(
-            lambda: edit_rich_transcript_message(status_message, bot, transcript)
+            lambda: edit_rich_transcript_message(
+                status_message, bot, transcript, summary
+            )
         )
         return
     except Exception as error:
@@ -287,7 +298,7 @@ async def deliver_transcript(message, status_message, bot, transcript: str) -> N
 
     try:
         await retry_delivery_request(
-            lambda: send_rich_transcript_reply(message, bot, transcript)
+            lambda: send_rich_transcript_reply(message, bot, transcript, summary)
         )
     except Exception as fallback_error:
         LOGGER.exception("Fallback Rich Message transcript delivery failed.")
@@ -402,13 +413,14 @@ async def transcribe_recording(
     secondary_inference_client: OpenAI,
     secondary_transcription_model: str,
     merge_model: str,
+    summary_model: str,
     converter: str,
     stage_locks: StageLocks,
     artifacts_directory: Path | None = None,
     progress: Callable[[str], Awaitable[None]] | None = None,
     scheduler: TranscriptionScheduler | None = None,
-) -> str:
-    """Run both ASR engines and consolidate their results into one transcript."""
+) -> tuple[str, str]:
+    """Run both ASR engines, consolidate their results, and summarize them."""
     wav_path = source.with_name(f"{source.stem}.prepared.wav")
     pipeline_started = time.monotonic()
     try:
@@ -571,10 +583,58 @@ async def transcribe_recording(
         except (OpenAIError, KeyError, OSError, ValueError) as error:
             raise TranscriptionError(f"The transcripts could not be merged: {error}") from error
 
-        if not merged_text.strip():
+        transcript = merged_text.strip()
+        if not transcript:
             raise TranscriptionError("The transcription service returned an empty transcript.")
+
+        summary = transcript[:TRANSCRIPT_SUMMARY_LENGTH]
+        try:
+            stage_started = time.monotonic()
+            LOGGER.info("Starting transcript summary through the inference provider.")
+            if scheduler is None:
+                summary_result, summary = await run_serial_stage(
+                    stage_locks.primary,
+                    WAITING_FOR_SUMMARY_STATUS,
+                    SUMMARY_STATUS,
+                    summarize_transcript,
+                    transcript,
+                    primary_inference_client,
+                    summary_model,
+                    progress=progress,
+                )
+            else:
+                async def report_summary_waiting() -> None:
+                    if progress is not None:
+                        await progress(WAITING_FOR_SUMMARY_STATUS)
+
+                async with scheduler.reserve(
+                    (TranscriptionResource.PRIMARY,),
+                    on_wait=report_summary_waiting,
+                ):
+                    if progress is not None:
+                        await progress(SUMMARY_STATUS)
+                    summary_result, summary = await run_blocking_operation(
+                        summarize_transcript,
+                        transcript,
+                        primary_inference_client,
+                        summary_model,
+                    )
+            if artifacts_directory is not None:
+                save_transcription_artifact(
+                    artifacts_directory, "summary", summary_result, summary
+                )
+            LOGGER.info(
+                "Transcript summary completed in %.1f s.",
+                time.monotonic() - stage_started,
+            )
+        except Exception:
+            LOGGER.exception(
+                "Transcript summary failed; using the transcript prefix instead."
+            )
+            summary = transcript[:TRANSCRIPT_SUMMARY_LENGTH]
+
         LOGGER.info("Transcription pipeline completed in %.1f s.", time.monotonic() - pipeline_started)
-        return merged_text.strip()
+        return transcript, summary
     finally:
         wav_path.unlink(missing_ok=True)
 
@@ -654,13 +714,14 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             if status_message is not None:
                 await edit_italic_status(status_message, text)
 
-        transcript = await transcribe_recording(
+        transcript, summary = await transcribe_recording(
             source,
             context.application.bot_data["primary_inference_client"],
             context.application.bot_data["primary_transcription_model"],
             context.application.bot_data["secondary_inference_client"],
             context.application.bot_data["secondary_transcription_model"],
             context.application.bot_data["merge_model"],
+            context.application.bot_data["summary_model"],
             context.application.bot_data["converter"],
             context.application.bot_data["stage_locks"],
             artifacts_directory,
@@ -691,7 +752,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
         return
 
-    await deliver_transcript(message, status_message, context.bot, transcript)
+    await deliver_transcript(message, status_message, context.bot, transcript, summary)
 
 
 async def handle_unsupported_message(
@@ -755,6 +816,7 @@ def main() -> None:
         secondary_inference_client=secondary_inference_client,
         secondary_transcription_model=secondary_transcription_model,
         merge_model=os.getenv("MERGE_MODEL", DEFAULT_MERGE_MODEL),
+        summary_model=required_env("SUMMARY_MODEL"),
         converter=converter,
         transcription_scheduler=scheduler,
     )

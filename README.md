@@ -40,6 +40,9 @@ Telegram → Tailscale Funnel → tailscale-ingress → bot container
 - **Merge model** receives both transcripts through the primary inference provider and combines
   their best-supported readings into one readable result. Both transcriptions are always
   made: the bot does not currently try to judge the quality of the first result.
+- **Summary model** receives the merged transcript through the primary inference provider and
+  creates the short description shown on the collapsed result. Set the required `SUMMARY_MODEL`
+  environment variable independently from `MERGE_MODEL`.
 - **oMLX** is the current local inference provider. It is not required by the architecture:
   configure any OpenAI-compatible providers with `INFERENCE_API_URL`, `INFERENCE_API_KEY`,
   `SECONDARY_INFERENCE_API_URL`, and `SECONDARY_INFERENCE_API_KEY`.
@@ -109,8 +112,8 @@ Docker Compose bind-mounts `./data` from the directory containing `docker-compos
 message ID (`YYYY-MM-DD_HH-MM-SS_<chat-id>_<message-id>`):
 
 - `data/voices/YYYY-MM/<recording-id>.<extension>` contains the downloaded audio.
-- `data/transcripts/YYYY-MM/<recording-id>/` contains the `primary`, `secondary`, and `merged`
-  responses in both `.json` and `.txt` formats.
+- `data/transcripts/YYYY-MM/<recording-id>/` contains the `primary`, `secondary`, `merged`, and
+  successful `summary` responses in both `.json` and `.txt` formats.
 
 The intermediate converted WAV is deleted after processing. The `data/` directory is intentionally
 excluded from Git. Incoming messages are handled concurrently, while the bot serializes each
