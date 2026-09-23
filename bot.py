@@ -37,6 +37,7 @@ from vorec.scheduling import TranscriptionResource, TranscriptionScheduler
 ENV_FILE = Path(".env")
 DEFAULT_PRIMARY_TRANSCRIPTION_MODEL = "whisper-large-v3-turbo-asr-fp16"
 DEFAULT_MERGE_MODEL = "gemma-4-26b-a4b-it-4bit"
+DEFAULT_TITLE_MODEL = "gemma-4-26b-a4b-it-4bit"
 DEFAULT_SECONDARY_TRANSCRIPTION_MODEL = "whisper-podlodka-turbo-mlx"
 DEFAULT_CONVERTER = "ffmpeg"
 UNSUPPORTED_MESSAGE_TEXT = "This message type is not supported. Please send audio."
@@ -816,7 +817,7 @@ def main() -> None:
         secondary_inference_client=secondary_inference_client,
         secondary_transcription_model=secondary_transcription_model,
         merge_model=os.getenv("MERGE_MODEL", DEFAULT_MERGE_MODEL),
-        title_model=required_env("TITLE_MODEL"),
+        title_model=os.getenv("TITLE_MODEL", DEFAULT_TITLE_MODEL),
         converter=converter,
         transcription_scheduler=scheduler,
     )

@@ -41,8 +41,8 @@ Telegram → Tailscale Funnel → tailscale-ingress → bot container
   their best-supported readings into one readable result. Both transcriptions are always
   made: the bot does not currently try to judge the quality of the first result.
 - **Title model** receives the merged transcript through the primary inference provider and
-  creates the short, distinctive title shown on the collapsed result. Set the required `TITLE_MODEL`
-  environment variable independently from `MERGE_MODEL`.
+  creates the short, distinctive title shown on the collapsed result. It defaults to
+  `gemma-4-26b-a4b-it-4bit`; set `TITLE_MODEL` to use a different model from `MERGE_MODEL`.
 - **oMLX** is the current local inference provider. It is not required by the architecture:
   configure any OpenAI-compatible providers with `INFERENCE_API_URL`, `INFERENCE_API_KEY`,
   `SECONDARY_INFERENCE_API_URL`, and `SECONDARY_INFERENCE_API_KEY`.

@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, Mock, call, patch
 import httpx
 from bot import (
     ConfigurationError,
+    DEFAULT_TITLE_MODEL,
     DELIVERY_FAILED_TEXT,
     DELIVERY_UNCONFIRMED_TEXT,
     FIRST_TRANSCRIPT_STATUS,
@@ -89,13 +90,6 @@ class BooleanEnvironmentTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(ConfigurationError, "true or false"):
                 boolean_env("SMART_TRANSCRIPTION_SCHEDULING")
-
-
-class RequiredEnvironmentTests(unittest.TestCase):
-    def test_title_model_is_required(self) -> None:
-        with patch.dict(os.environ, {}, clear=True):
-            with self.assertRaisesRegex(ConfigurationError, "TITLE_MODEL"):
-                required_env("TITLE_MODEL")
 
 
 class PersistentStorageTests(unittest.TestCase):
@@ -909,7 +903,6 @@ class ApplicationConfigurationTests(unittest.TestCase):
             "INFERENCE_API_KEY": "inference-key",
             "SECONDARY_INFERENCE_API_URL": "https://secondary.example.test",
             "SECONDARY_INFERENCE_API_KEY": "secondary-key",
-            "TITLE_MODEL": "title-model",
             "SMART_TRANSCRIPTION_SCHEDULING": "false",
         }
         with patch.dict(os.environ, environment, clear=True):
@@ -942,7 +935,7 @@ class ApplicationConfigurationTests(unittest.TestCase):
         )
         self.assertEqual(
             application.bot_data.update.call_args.kwargs["title_model"],
-            "title-model",
+            DEFAULT_TITLE_MODEL,
         )
         application.run_webhook.assert_called_once()
 
