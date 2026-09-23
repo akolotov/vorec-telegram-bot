@@ -7,11 +7,17 @@ import html
 import json
 import logging
 import os
+import re
+import secrets
 import shutil
 import subprocess
 import time
+import uuid
 from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from http import HTTPStatus
 from pathlib import Path
 from typing import TypeVar
 from urllib.parse import urlparse
@@ -23,6 +29,11 @@ from telegram import Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
+from starlette.applications import Starlette
+from starlette.requests import ClientDisconnect, Request
+from starlette.responses import JSONResponse, Response
+from starlette.routing import Route
+import uvicorn
 
 from vorec.audio import (
     merge_transcripts,
@@ -65,6 +76,25 @@ DEFAULT_WEBHOOK_LISTEN = "0.0.0.0"
 DEFAULT_WEBHOOK_PORT = 8080
 DATA_DIRECTORY = Path("data")
 TRANSCRIPT_SUMMARY_LENGTH = 50
+DEFAULT_TRANSCRIPTION_API_MAX_JOBS = 4
+DEFAULT_TRANSCRIPTION_API_MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+DEFAULT_TRANSCRIPTION_API_UPLOAD_TIMEOUT_SECONDS = 10 * 60
+TRANSCRIPTION_API_RETRY_AFTER_SECONDS = 60
+DOCKER_ALIAS_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+SUPPORTED_API_AUDIO_TYPES = {
+    "audio/aac": ".aac",
+    "audio/flac": ".flac",
+    "audio/m4a": ".m4a",
+    "audio/mp4": ".m4a",
+    "audio/mpeg": ".mp3",
+    "audio/ogg": ".ogg",
+    "audio/opus": ".opus",
+    "audio/wav": ".wav",
+    "audio/webm": ".webm",
+    "audio/x-flac": ".flac",
+    "audio/x-m4a": ".m4a",
+    "audio/x-wav": ".wav",
+}
 
 LOGGER = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -76,6 +106,36 @@ class ConfigurationError(ValueError):
 
 class TranscriptionError(RuntimeError):
     """A transcription failure with a user-safe English explanation."""
+
+
+class ApiJobLimiter:
+    """Atomically limit accepted API uploads and background jobs."""
+
+    def __init__(self, capacity: int) -> None:
+        self.capacity = capacity
+        self._active = 0
+        self._lock = asyncio.Lock()
+
+    async def try_acquire(self) -> bool:
+        async with self._lock:
+            if self._active >= self.capacity:
+                return False
+            self._active += 1
+            return True
+
+    async def release(self) -> None:
+        async with self._lock:
+            if self._active <= 0:
+                raise RuntimeError("API job limiter released without a reservation")
+            self._active -= 1
+
+
+@dataclass(frozen=True)
+class ApiTranscriptionJob:
+    job_id: str
+    chat_id: int
+    source: Path
+    artifacts_directory: Path
 
 
 def rich_transcript_blocks(transcript: str, summary: str) -> list[dict[str, object]]:
@@ -128,6 +188,63 @@ def allowed_user_ids(value: str) -> set[int]:
     return user_ids
 
 
+def transcription_api_credentials(
+    value: str, allowed_ids: set[int]
+) -> dict[int, str]:
+    """Parse comma-separated chat-id:token credentials and validate ownership."""
+    credentials: dict[int, str] = {}
+    tokens: set[str] = set()
+    for raw_item in value.split(","):
+        item = raw_item.strip()
+        if not item:
+            continue
+        chat_id_text, separator, token = item.partition(":")
+        if not separator or not token.strip():
+            raise ConfigurationError(
+                "TRANSCRIPTION_API_CREDENTIALS must contain chat-id:token pairs."
+            )
+        try:
+            chat_id = int(chat_id_text.strip())
+        except ValueError as error:
+            raise ConfigurationError(
+                "TRANSCRIPTION_API_CREDENTIALS chat IDs must be integers."
+            ) from error
+        token = token.strip()
+        if chat_id not in allowed_ids:
+            raise ConfigurationError(
+                "Every transcription API chat ID must be present in ALLOWED_USER_IDS."
+            )
+        if chat_id in credentials:
+            raise ConfigurationError("Transcription API chat IDs must be unique.")
+        if token in tokens:
+            raise ConfigurationError("Transcription API tokens must be unique.")
+        credentials[chat_id] = token
+        tokens.add(token)
+    if not credentials:
+        raise ConfigurationError(
+            "TRANSCRIPTION_API_CREDENTIALS must contain at least one chat-id:token pair."
+        )
+    return credentials
+
+
+def positive_integer_env(name: str, default: int) -> int:
+    """Return a positive integer environment setting."""
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError as error:
+        raise ConfigurationError(f"{name} must be an integer.") from error
+    if value <= 0:
+        raise ConfigurationError(f"{name} must be greater than zero.")
+    return value
+
+
+def transcription_api_path() -> str:
+    alias = required_env("WEBHOOK_DOCKER_ALIAS")
+    if not DOCKER_ALIAS_PATTERN.fullmatch(alias):
+        raise ConfigurationError("WEBHOOK_DOCKER_ALIAS is not a valid Docker network alias.")
+    return f"/apps/{alias}/transcriptions"
+
+
 def webhook_configuration() -> tuple[str, str, str, int, str]:
     """Return the public and internal settings for the Telegram webhook."""
     public_base_url = required_env("WEBHOOK_PUBLIC_BASE_URL").rstrip("/")
@@ -175,6 +292,23 @@ async def send_rich_transcript_reply(
     # and the library's InputRichMessage types once python-telegram-bot supports them.
     await bot._post("sendRichMessage", data=data)
     LOGGER.info("Sent Rich Message reply with %d characters.", len(transcript))
+
+
+async def send_rich_transcript(
+    chat_id: int, bot, transcript: str, summary: str
+) -> None:
+    """Send a standalone Rich Message transcript to a Telegram chat."""
+    await bot._post(
+        "sendRichMessage",
+        data={
+            "chat_id": chat_id,
+            "rich_message": {
+                "blocks": rich_transcript_blocks(transcript, summary),
+                "skip_entity_detection": True,
+            },
+        },
+    )
+    LOGGER.info("Sent standalone Rich Message with %d characters.", len(transcript))
 
 
 async def edit_rich_transcript_message(
@@ -315,6 +449,56 @@ async def deliver_transcript(
     )
 
 
+async def deliver_api_transcript(
+    job: ApiTranscriptionJob, bot, transcript: str, summary: str
+) -> None:
+    """Deliver an API transcript with duplicate-safe retry semantics."""
+    try:
+        await retry_delivery_request(
+            lambda: send_rich_transcript(
+                job.chat_id, bot, transcript, summary
+            )
+        )
+    except Exception as error:
+        outcome = (
+            "unconfirmed" if delivery_outcome_is_uncertain(error) else "failed"
+        )
+        LOGGER.exception(
+            "API transcript delivery %s for job %s.", outcome, job.job_id
+        )
+
+
+async def report_api_processing_failure(
+    job: ApiTranscriptionJob, bot, error: Exception
+) -> None:
+    """Best-effort notification after an accepted API job fails."""
+    reason = (
+        str(error).strip()
+        if isinstance(error, TranscriptionError)
+        else f"An unexpected internal error occurred ({error.__class__.__name__})."
+    )
+    text = f"Could not transcribe API job {job.job_id}: {reason}"[:600]
+    try:
+        await retry_delivery_request(
+            lambda: bot.send_message(
+                chat_id=job.chat_id,
+                text=f"<i>{html.escape(text)}</i>",
+                parse_mode=ParseMode.HTML,
+            )
+        )
+    except Exception as delivery_error:
+        outcome = (
+            "unconfirmed"
+            if delivery_outcome_is_uncertain(delivery_error)
+            else "failed"
+        )
+        LOGGER.exception(
+            "API failure notification delivery %s for job %s.",
+            outcome,
+            job.job_id,
+        )
+
+
 async def run_serial_stage(
     lock: asyncio.Lock,
     waiting_status: str,
@@ -439,7 +623,12 @@ async def transcribe_recording(
                 progress=progress,
             )
             LOGGER.info("Audio conversion completed in %.1f s.", time.monotonic() - stage_started)
-        except (subprocess.CalledProcessError, OSError) as error:
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            OSError,
+            ValueError,
+        ) as error:
             raise TranscriptionError(f"The audio could not be converted: {error}") from error
 
         if scheduler is None:
@@ -772,6 +961,273 @@ async def handle_unsupported_message(
     )
 
 
+def api_recording_paths(
+    job_id: str,
+    suffix: str,
+    *,
+    data_directory: Path = DATA_DIRECTORY,
+    now: datetime | None = None,
+) -> tuple[Path, Path]:
+    """Return persistent paths for an API-submitted recording."""
+    timestamp = now or datetime.now(UTC)
+    month = timestamp.strftime("%Y-%m")
+    recording_id = f"{timestamp.strftime('%Y-%m-%d_%H-%M-%S')}_api_{job_id}"
+    source = data_directory / "voices" / month / f"{recording_id}{suffix}"
+    return source, data_directory / "transcripts" / month / recording_id
+
+
+def bearer_chat_id(request: Request, credentials: dict[int, str]) -> int | None:
+    """Return the chat ID owned by the request's Bearer token."""
+    authorization = request.headers.get("authorization", "")
+    scheme, separator, token = authorization.partition(" ")
+    if not separator or scheme.lower() != "bearer" or not token:
+        return None
+    for chat_id, expected_token in credentials.items():
+        if secrets.compare_digest(token, expected_token):
+            return chat_id
+    return None
+
+
+async def process_api_transcription(application, job: ApiTranscriptionJob) -> None:
+    """Run the shared pipeline and deliver one accepted API job."""
+    try:
+        transcript, summary = await transcribe_recording(
+            job.source,
+            application.bot_data["primary_inference_client"],
+            application.bot_data["primary_transcription_model"],
+            application.bot_data["secondary_inference_client"],
+            application.bot_data["secondary_transcription_model"],
+            application.bot_data["merge_model"],
+            application.bot_data["summary_model"],
+            application.bot_data["converter"],
+            application.bot_data["stage_locks"],
+            job.artifacts_directory,
+            scheduler=application.bot_data["transcription_scheduler"],
+        )
+    except Exception as error:
+        LOGGER.exception("API transcription failed for job %s.", job.job_id)
+        await report_api_processing_failure(job, application.bot, error)
+        return
+
+    await deliver_api_transcript(job, application.bot, transcript, summary)
+
+
+def create_web_application(
+    application,
+    *,
+    webhook_path: str,
+    webhook_url: str,
+    webhook_secret_token: str,
+    api_path: str,
+    api_credentials: dict[int, str],
+    api_job_limiter: ApiJobLimiter,
+    api_max_upload_bytes: int,
+    api_upload_timeout_seconds: int,
+) -> Starlette:
+    """Build the shared Telegram webhook and transcription API server."""
+    accepting_api_requests = False
+
+    async def telegram_webhook(request: Request) -> Response:
+        if request.headers.get("content-type", "").partition(";")[0] != "application/json":
+            return JSONResponse(
+                {"ok": False, "error": "Expected application/json."},
+                status_code=HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+            )
+        supplied_secret = request.headers.get("x-telegram-bot-api-secret-token", "")
+        if not secrets.compare_digest(supplied_secret, webhook_secret_token):
+            return JSONResponse(
+                {"ok": False, "error": "Forbidden."},
+                status_code=HTTPStatus.FORBIDDEN,
+            )
+        try:
+            data = await request.json()
+            update = Update.de_json(data, application.bot)
+        except Exception:
+            LOGGER.exception("Could not deserialize a Telegram webhook update.")
+            return JSONResponse(
+                {"ok": False, "error": "Invalid Telegram update."},
+                status_code=HTTPStatus.BAD_REQUEST,
+            )
+        if update is not None:
+            await application.update_queue.put(update)
+        return Response(status_code=HTTPStatus.OK)
+
+    async def transcription_api(request: Request) -> Response:
+        nonlocal accepting_api_requests
+        if not accepting_api_requests:
+            return JSONResponse(
+                {"ok": False, "error": "Service is not accepting new jobs."},
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+
+        token_chat_id = bearer_chat_id(request, api_credentials)
+        if token_chat_id is None:
+            return JSONResponse(
+                {"ok": False, "error": "Invalid Bearer token."},
+                status_code=HTTPStatus.UNAUTHORIZED,
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        chat_id_header = request.headers.get("x-telegram-chat-id", "")
+        try:
+            chat_id = int(chat_id_header)
+        except ValueError:
+            return JSONResponse(
+                {"ok": False, "error": "X-Telegram-Chat-Id must be an integer."},
+                status_code=HTTPStatus.BAD_REQUEST,
+            )
+        if chat_id != token_chat_id:
+            return JSONResponse(
+                {"ok": False, "error": "The token does not authorize this chat."},
+                status_code=HTTPStatus.FORBIDDEN,
+            )
+
+        content_type = request.headers.get("content-type", "").partition(";")[0].lower()
+        suffix = SUPPORTED_API_AUDIO_TYPES.get(content_type)
+        if suffix is None:
+            return JSONResponse(
+                {"ok": False, "error": "Unsupported audio Content-Type."},
+                status_code=HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+            )
+
+        content_length = request.headers.get("content-length")
+        if content_length is not None:
+            try:
+                declared_size = int(content_length)
+            except ValueError:
+                return JSONResponse(
+                    {"ok": False, "error": "Invalid Content-Length."},
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
+            if declared_size < 0:
+                return JSONResponse(
+                    {"ok": False, "error": "Invalid Content-Length."},
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
+            if declared_size > api_max_upload_bytes:
+                return JSONResponse(
+                    {"ok": False, "error": "Audio body is too large."},
+                    status_code=HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                )
+
+        if not await api_job_limiter.try_acquire():
+            return JSONResponse(
+                {"ok": False, "error": "Too many transcription jobs."},
+                status_code=HTTPStatus.TOO_MANY_REQUESTS,
+                headers={"Retry-After": str(TRANSCRIPTION_API_RETRY_AFTER_SECONDS)},
+            )
+
+        reservation_transferred = False
+        job_id = uuid.uuid4().hex
+        source, artifacts_directory = api_recording_paths(job_id, suffix)
+        partial_source = source.with_name(f"{source.name}.part")
+        try:
+            source.parent.mkdir(parents=True, exist_ok=True)
+            bytes_received = 0
+            try:
+                async with asyncio.timeout(api_upload_timeout_seconds):
+                    with partial_source.open("xb") as output:
+                        async for chunk in request.stream():
+                            bytes_received += len(chunk)
+                            if bytes_received > api_max_upload_bytes:
+                                return JSONResponse(
+                                    {"ok": False, "error": "Audio body is too large."},
+                                    status_code=HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                                )
+                            output.write(chunk)
+            except TimeoutError:
+                return JSONResponse(
+                    {"ok": False, "error": "Audio upload timed out."},
+                    status_code=HTTPStatus.REQUEST_TIMEOUT,
+                )
+            except ClientDisconnect:
+                return Response(status_code=HTTPStatus.BAD_REQUEST)
+
+            if bytes_received == 0:
+                return JSONResponse(
+                    {"ok": False, "error": "Audio body is empty."},
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
+
+            partial_source.replace(source)
+            job = ApiTranscriptionJob(job_id, chat_id, source, artifacts_directory)
+
+            async def run_reserved_job() -> None:
+                try:
+                    await process_api_transcription(application, job)
+                finally:
+                    await api_job_limiter.release()
+
+            job_coroutine = run_reserved_job()
+            try:
+                application.create_task(
+                    job_coroutine, name=f"api-transcription:{job_id}"
+                )
+            except Exception:
+                job_coroutine.close()
+                source.unlink(missing_ok=True)
+                LOGGER.exception("Could not schedule API transcription job %s.", job_id)
+                return JSONResponse(
+                    {"ok": False, "error": "Could not schedule the transcription."},
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+            reservation_transferred = True
+            LOGGER.info(
+                "Accepted API transcription job %s for chat %d (%d bytes).",
+                job_id,
+                chat_id,
+                bytes_received,
+            )
+            return JSONResponse(
+                {"ok": True, "job_id": job_id},
+                status_code=HTTPStatus.ACCEPTED,
+            )
+        except OSError:
+            LOGGER.exception("Could not persist API transcription job %s.", job_id)
+            return JSONResponse(
+                {"ok": False, "error": "Could not store the audio."},
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+        finally:
+            partial_source.unlink(missing_ok=True)
+            if not reservation_transferred:
+                await api_job_limiter.release()
+
+    @asynccontextmanager
+    async def lifespan(_: Starlette):
+        nonlocal accepting_api_requests
+        initialized = False
+        started = False
+        try:
+            await application.initialize()
+            initialized = True
+            await application.start()
+            started = True
+            await application.bot.set_webhook(
+                url=webhook_url,
+                allowed_updates=Update.ALL_TYPES,
+                secret_token=webhook_secret_token,
+            )
+            accepting_api_requests = True
+            yield
+        finally:
+            accepting_api_requests = False
+            try:
+                if started:
+                    await application.stop()
+            finally:
+                if initialized:
+                    await application.shutdown()
+
+    return Starlette(
+        routes=[
+            Route(webhook_path, telegram_webhook, methods=["POST"]),
+            Route(api_path, transcription_api, methods=["POST"]),
+        ],
+        lifespan=lifespan,
+    )
+
+
 def main() -> None:
     load_dotenv(ENV_FILE)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -780,10 +1236,25 @@ def main() -> None:
 
     token = required_env("TELEGRAM_BOT_TOKEN")
     user_ids = allowed_user_ids(required_env("ALLOWED_USER_IDS"))
+    api_credentials = transcription_api_credentials(
+        required_env("TRANSCRIPTION_API_CREDENTIALS"), user_ids
+    )
+    api_path = transcription_api_path()
+    api_max_jobs = positive_integer_env(
+        "TRANSCRIPTION_API_MAX_JOBS", DEFAULT_TRANSCRIPTION_API_MAX_JOBS
+    )
+    api_max_upload_bytes = positive_integer_env(
+        "TRANSCRIPTION_API_MAX_UPLOAD_BYTES",
+        DEFAULT_TRANSCRIPTION_API_MAX_UPLOAD_BYTES,
+    )
+    api_upload_timeout_seconds = positive_integer_env(
+        "TRANSCRIPTION_API_UPLOAD_TIMEOUT_SECONDS",
+        DEFAULT_TRANSCRIPTION_API_UPLOAD_TIMEOUT_SECONDS,
+    )
     webhook_url, webhook_path, webhook_secret_token, webhook_port, webhook_listen = (
         webhook_configuration()
     )
-    converter = resolve_converter(os.getenv("AUDIO_CONVERTER", DEFAULT_CONVERTER))
+    converter = resolve_converter(DEFAULT_CONVERTER)
     smart_scheduling = boolean_env("SMART_TRANSCRIPTION_SCHEDULING")
     if not shutil.which(converter):
         raise ConfigurationError(f"Audio converter executable not found: {converter}")
@@ -805,7 +1276,13 @@ def main() -> None:
     scheduler = TranscriptionScheduler() if smart_scheduling else None
 
     audio_messages = filters.VOICE | filters.AUDIO | filters.Document.Category("audio/")
-    app = ApplicationBuilder().token(token).concurrent_updates(True).build()
+    app = (
+        ApplicationBuilder()
+        .token(token)
+        .updater(None)
+        .concurrent_updates(True)
+        .build()
+    )
     app.bot_data.update(
         allowed_user_ids=user_ids,
         stage_locks=StageLocks(),
@@ -827,20 +1304,29 @@ def main() -> None:
             handle_unsupported_message,
         )
     )
+    web_application = create_web_application(
+        app,
+        webhook_path=webhook_path,
+        webhook_url=webhook_url,
+        webhook_secret_token=webhook_secret_token,
+        api_path=api_path,
+        api_credentials=api_credentials,
+        api_job_limiter=ApiJobLimiter(api_max_jobs),
+        api_max_upload_bytes=api_max_upload_bytes,
+        api_upload_timeout_seconds=api_upload_timeout_seconds,
+    )
     LOGGER.info(
-        "Starting webhook listener on %s:%d%s for %d allowed user(s).",
+        "Starting HTTP listener on %s:%d for Telegram at %s and transcription API at %s.",
         webhook_listen,
         webhook_port,
         webhook_path,
-        len(user_ids),
+        api_path,
     )
-    app.run_webhook(
-        listen=webhook_listen,
+    uvicorn.run(
+        web_application,
+        host=webhook_listen,
         port=webhook_port,
-        url_path=webhook_path,
-        webhook_url=webhook_url,
-        allowed_updates=Update.ALL_TYPES,
-        secret_token=webhook_secret_token,
+        access_log=False,
     )
 
 

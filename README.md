@@ -2,6 +2,9 @@
 
 Telegram bot that transcribes allowed users' voice messages and audio files.
 
+The same pipeline is available through an authenticated HTTP endpoint. API results are delivered
+as standalone messages to the caller's authorized private Telegram chat.
+
 ![An Apple Watch with the X-Large face and a single Voice Memos complication](.assets/apple-watch-v8-voice-memo-faces.png)
 
 ## Why this exists
@@ -32,6 +35,8 @@ served through oMLX.
 Telegram → Tailscale Funnel → tailscale-ingress → bot container
                                                    ├→ primary inference provider
                                                    └→ secondary inference provider
+
+Raw audio → authenticated `/apps/.../transcriptions` endpoint → same pipeline → Telegram
 ```
 
 - **Primary inference provider** produces the main transcription.
@@ -52,6 +57,9 @@ Set `SMART_TRANSCRIPTION_SCHEDULING=true` only when the primary and secondary pr
 independent capacity. In that mode, concurrent recordings can start with whichever ASR resource
 is available, but each recording still uses only one ASR at a time and completes both before
 merge. The setting defaults to `false`; its value must be `true` or `false`.
+
+All recordings are limited to 30 minutes. Conversion uses system ffmpeg when available and the
+bundled ffmpeg otherwise; a conversion is stopped if it does not finish within five minutes.
 
 All configuration, including API URLs and tokens, is in `.env`. Create it from the example and
 then configure its values:
@@ -91,6 +99,43 @@ WEBHOOK_PATH=/hooks/<docker-alias>/<webhook-endpoint>
 WEBHOOK_SECRET_TOKEN=<new-random-secret>
 ```
 
+## Transcription HTTP API
+
+The API uses the same gateway hostname and Docker alias as the Telegram webhook:
+
+```text
+https://<funnel-hostname>.<tailnet>.ts.net/apps/<docker-alias>/transcriptions
+```
+
+Configure one independently generated Bearer token per allowed private chat. Every configured
+chat ID must also appear in `ALLOWED_USER_IDS`:
+
+```dotenv
+TRANSCRIPTION_API_CREDENTIALS=123456789:<first-token>,987654321:<second-token>
+```
+
+Send the audio bytes directly as the request body:
+
+```sh
+curl --fail-with-body \
+  -X POST \
+  -H "Authorization: Bearer <token>" \
+  -H "X-Telegram-Chat-Id: 123456789" \
+  -H "Content-Type: audio/mp4" \
+  --data-binary @recording.m4a \
+  https://<funnel-hostname>.<tailnet>.ts.net/apps/<docker-alias>/transcriptions
+```
+
+A successful upload returns `202 Accepted` with a job ID. At most four API uploads and jobs may be
+active at once; additional requests receive `429 Too Many Requests`. Uploads are limited to 100 MiB
+and ten minutes. Jobs live in bot memory, so a container restart may interrupt an accepted job,
+although its source file remains in `data/`.
+
+The [`tailscale-funnel-gateway`](https://github.com/akolotov/tailscale-funnel-gateway) `/apps/`
+ingress must accept request bodies up to 100 MiB and stream them to the application without request
+buffering. Its client-body timeout is only an inactivity timeout; this application enforces the
+absolute upload deadline, concurrency limit, and partial-file cleanup.
+
 Each deployment must also set a unique `COMPOSE_PROJECT_NAME`. Docker Compose uses this name to
 keep containers from different checkouts separate. A second deployment needs a different
 `TELEGRAM_BOT_TOKEN`, `COMPOSE_PROJECT_NAME`, `WEBHOOK_DOCKER_ALIAS`, and matching
@@ -114,6 +159,8 @@ message ID (`YYYY-MM-DD_HH-MM-SS_<chat-id>_<message-id>`):
 - `data/voices/YYYY-MM/<recording-id>.<extension>` contains the downloaded audio.
 - `data/transcripts/YYYY-MM/<recording-id>/` contains the `primary`, `secondary`, `merged`, and
   successful `summary` responses in both `.json` and `.txt` formats.
+
+API recording IDs contain `_api_<job-id>` instead of Telegram chat and message IDs.
 
 The intermediate converted WAV is deleted after processing. The `data/` directory is intentionally
 excluded from Git. Incoming messages are handled concurrently, while the bot serializes each
