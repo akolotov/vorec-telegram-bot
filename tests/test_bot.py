@@ -18,7 +18,7 @@ from bot import (
     PRIMARY_TRANSCRIPTION_STATUS,
     SECONDARY_TRANSCRIPTION_STATUS,
     SECOND_TRANSCRIPT_STATUS,
-    SUMMARY_STATUS,
+    TITLE_STATUS,
     StageLocks,
     TranscriptionError,
     UNSUPPORTED_MESSAGE_TEXT,
@@ -42,11 +42,11 @@ from bot import (
 )
 from telegram.error import BadRequest, NetworkError, TimedOut
 from vorec.audio import (
-    SUMMARY_MAX_TOKENS,
-    SUMMARY_REQUEST_TIMEOUT,
+    TITLE_MAX_TOKENS,
+    TITLE_REQUEST_TIMEOUT,
     prepare_wav,
     resolve_converter,
-    summarize_transcript,
+    generate_transcript_title,
 )
 from vorec.scheduling import TranscriptionScheduler
 
@@ -92,10 +92,10 @@ class BooleanEnvironmentTests(unittest.TestCase):
 
 
 class RequiredEnvironmentTests(unittest.TestCase):
-    def test_summary_model_is_required(self) -> None:
+    def test_title_model_is_required(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
-            with self.assertRaisesRegex(ConfigurationError, "SUMMARY_MODEL"):
-                required_env("SUMMARY_MODEL")
+            with self.assertRaisesRegex(ConfigurationError, "TITLE_MODEL"):
+                required_env("TITLE_MODEL")
 
 
 class PersistentStorageTests(unittest.TestCase):
@@ -214,68 +214,69 @@ class WebhookConfigurationTests(unittest.TestCase):
             webhook_configuration()
 
 
-class TranscriptSummaryTests(unittest.TestCase):
+class TranscriptTitleTests(unittest.TestCase):
     def test_uses_short_non_retrying_request_and_returns_clean_text(self) -> None:
-        message = Mock(content="  Команда перенесла запуск из-за ошибки оплаты.  ")
+        message = Mock(content="  Перенос запуска из-за ошибки оплаты  ")
         response = Mock(choices=[Mock(message=message)])
-        response.model_dump.return_value = {"id": "summary-response"}
-        summary_client = Mock()
-        summary_client.chat.completions.create.return_value = response
+        response.model_dump.return_value = {"id": "title-response"}
+        title_client = Mock()
+        title_client.chat.completions.create.return_value = response
         client = Mock()
-        client.with_options.return_value = summary_client
+        client.with_options.return_value = title_client
 
-        result = summarize_transcript("Full transcript", client, "summary-model")
+        result = generate_transcript_title("Full transcript", client, "title-model")
 
         self.assertEqual(
             result,
             (
-                {"id": "summary-response"},
-                "Команда перенесла запуск из-за ошибки оплаты.",
+                {"id": "title-response"},
+                "Перенос запуска из-за ошибки оплаты",
             ),
         )
         client.with_options.assert_called_once_with(
-            timeout=SUMMARY_REQUEST_TIMEOUT,
+            timeout=TITLE_REQUEST_TIMEOUT,
             max_retries=0,
         )
-        request = summary_client.chat.completions.create.call_args.kwargs
-        self.assertEqual(request["model"], "summary-model")
+        request = title_client.chat.completions.create.call_args.kwargs
+        self.assertEqual(request["model"], "title-model")
         self.assertEqual(request["temperature"], 0)
-        self.assertEqual(request["max_tokens"], SUMMARY_MAX_TOKENS)
-        self.assertIn("7-10 words", request["messages"][0]["content"])
+        self.assertEqual(request["max_tokens"], TITLE_MAX_TOKENS)
+        self.assertIn("5-10 words", request["messages"][0]["content"])
+        self.assertIn("same broad topic", request["messages"][0]["content"])
         self.assertIn(
             "<TRANSCRIPT>\nFull transcript\n</TRANSCRIPT>",
             request["messages"][0]["content"],
         )
 
-    def test_rejects_empty_summary_response(self) -> None:
+    def test_rejects_empty_title_response(self) -> None:
         response = Mock(choices=[])
-        summary_client = Mock()
-        summary_client.chat.completions.create.return_value = response
+        title_client = Mock()
+        title_client.chat.completions.create.return_value = response
         client = Mock()
-        client.with_options.return_value = summary_client
+        client.with_options.return_value = title_client
 
         with self.assertRaisesRegex(ValueError, "empty assistant text"):
-            summarize_transcript("Full transcript", client, "summary-model")
+            generate_transcript_title("Full transcript", client, "title-model")
 
-    def test_malformed_summary_response_raises_parsing_error(self) -> None:
+    def test_malformed_title_response_raises_parsing_error(self) -> None:
         response = Mock(choices=[object()])
-        summary_client = Mock()
-        summary_client.chat.completions.create.return_value = response
+        title_client = Mock()
+        title_client.chat.completions.create.return_value = response
         client = Mock()
-        client.with_options.return_value = summary_client
+        client.with_options.return_value = title_client
 
         with self.assertRaises(AttributeError):
-            summarize_transcript("Full transcript", client, "summary-model")
+            generate_transcript_title("Full transcript", client, "title-model")
 
 
 class RichMessageTests(unittest.TestCase):
-    def test_uses_provided_details_summary(self) -> None:
+    def test_uses_provided_details_title(self) -> None:
         self.assertEqual(
-            rich_transcript_blocks("full transcript", "Specific summary"),
+            rich_transcript_blocks("full transcript", "Specific title"),
             [
                 {
                     "type": "details",
-                    "summary": "Specific summary",
+                    "summary": "Specific title",
                     "blocks": [{"type": "paragraph", "text": "full transcript"}],
                 }
             ],
@@ -288,7 +289,7 @@ class RichMessageTests(unittest.TestCase):
 
         asyncio.run(
             send_rich_transcript_reply(
-                message, bot, "verbatim _text_", "Specific summary"
+                message, bot, "verbatim _text_", "Specific title"
             )
         )
 
@@ -300,7 +301,7 @@ class RichMessageTests(unittest.TestCase):
                     "blocks": [
                         {
                             "type": "details",
-                            "summary": "Specific summary",
+                            "summary": "Specific title",
                             "blocks": [
                                 {"type": "paragraph", "text": "verbatim _text_"}
                             ],
@@ -320,7 +321,7 @@ class RichMessageTests(unittest.TestCase):
 
         asyncio.run(
             edit_rich_transcript_message(
-                status_message, bot, "final text", "Specific summary"
+                status_message, bot, "final text", "Specific title"
             )
         )
 
@@ -333,7 +334,7 @@ class RichMessageTests(unittest.TestCase):
                     "blocks": [
                         {
                             "type": "details",
-                            "summary": "Specific summary",
+                            "summary": "Specific title",
                             "blocks": [
                                 {"type": "paragraph", "text": "final text"}
                             ],
@@ -356,7 +357,7 @@ class TranscriptDeliveryTests(unittest.TestCase):
         bot = Mock(_post=AsyncMock())
 
         asyncio.run(
-            deliver_transcript(message, None, bot, "final text", "Specific summary")
+            deliver_transcript(message, None, bot, "final text", "Specific title")
         )
 
         bot._post.assert_awaited_once()
@@ -368,7 +369,7 @@ class TranscriptDeliveryTests(unittest.TestCase):
         bot = Mock(_post=AsyncMock(side_effect=BadRequest("send rejected")))
 
         asyncio.run(
-            deliver_transcript(message, None, bot, "final text", "Specific summary")
+            deliver_transcript(message, None, bot, "final text", "Specific title")
         )
 
         bot._post.assert_awaited_once()
@@ -386,7 +387,7 @@ class TranscriptDeliveryTests(unittest.TestCase):
         bot._post = AsyncMock(side_effect=[BadRequest("rejected"), True])
 
         asyncio.run(
-            deliver_transcript(message, status, bot, "final text", "Specific summary")
+            deliver_transcript(message, status, bot, "final text", "Specific title")
         )
 
         self.assertEqual(bot._post.await_count, 2)
@@ -407,7 +408,7 @@ class TranscriptDeliveryTests(unittest.TestCase):
         )
 
         asyncio.run(
-            deliver_transcript(message, status, bot, "final text", "Specific summary")
+            deliver_transcript(message, status, bot, "final text", "Specific title")
         )
 
         self.assertEqual(bot._post.await_count, 2)
@@ -424,7 +425,7 @@ class TranscriptDeliveryTests(unittest.TestCase):
         bot = Mock(_post=AsyncMock(side_effect=TimedOut("unknown outcome")))
 
         asyncio.run(
-            deliver_transcript(message, status, bot, "final text", "Specific summary")
+            deliver_transcript(message, status, bot, "final text", "Specific title")
         )
 
         bot._post.assert_awaited_once()
@@ -450,7 +451,7 @@ class TranscriptDeliveryTests(unittest.TestCase):
         with patch("bot.asyncio.sleep", new_callable=AsyncMock) as sleep:
             asyncio.run(
                 deliver_transcript(
-                    message, status, bot, "final text", "Specific summary"
+                    message, status, bot, "final text", "Specific title"
                 )
             )
 
@@ -477,7 +478,7 @@ class TranscriptDeliveryTests(unittest.TestCase):
         with patch("bot.asyncio.sleep", new_callable=AsyncMock):
             asyncio.run(
                 deliver_transcript(
-                    message, status, bot, "final text", "Specific summary"
+                    message, status, bot, "final text", "Specific title"
                 )
             )
 
@@ -508,7 +509,7 @@ class TranscriptDeliveryTests(unittest.TestCase):
         with patch("bot.asyncio.sleep", new_callable=AsyncMock) as sleep:
             asyncio.run(
                 deliver_transcript(
-                    message, None, bot, "final text", "Specific summary"
+                    message, None, bot, "final text", "Specific title"
                 )
             )
 
@@ -538,7 +539,7 @@ class TranscriptDeliveryTests(unittest.TestCase):
                 with patch("bot.asyncio.sleep", new_callable=AsyncMock) as sleep:
                     asyncio.run(
                         deliver_transcript(
-                            message, None, bot, "final text", "Specific summary"
+                            message, None, bot, "final text", "Specific title"
                         )
                     )
 
@@ -556,7 +557,7 @@ class TranscriptDeliveryTests(unittest.TestCase):
         bot = Mock(_post=AsyncMock(side_effect=error))
 
         asyncio.run(
-            deliver_transcript(message, status, bot, "final text", "Specific summary")
+            deliver_transcript(message, status, bot, "final text", "Specific title")
         )
 
         bot._post.assert_awaited_once()
@@ -572,7 +573,7 @@ class TranscriptDeliveryTests(unittest.TestCase):
         )
 
         asyncio.run(
-            deliver_transcript(message, status, bot, "final text", "Specific summary")
+            deliver_transcript(message, status, bot, "final text", "Specific title")
         )
 
         self.assertEqual(bot._post.await_count, 2)
@@ -623,7 +624,7 @@ class HandleAudioTests(unittest.TestCase):
             "secondary_inference_client": Mock(),
             "secondary_transcription_model": "secondary-model",
             "merge_model": "merge-model",
-            "summary_model": "summary-model",
+            "title_model": "title-model",
             "converter": "ffmpeg",
             "transcription_scheduler": None,
         }
@@ -649,10 +650,10 @@ class HandleAudioTests(unittest.TestCase):
                     FIRST_TRANSCRIPT_STATUS,
                     SECOND_TRANSCRIPT_STATUS,
                     MERGING_STATUS,
-                    SUMMARY_STATUS,
+                    TITLE_STATUS,
                 ):
                     await progress(stage)
-                return "final text", "Specific summary"
+                return "final text", "Specific title"
 
             transcribe_recording.side_effect = transcribe
             asyncio.run(handle_audio(update, context))
@@ -670,7 +671,7 @@ class HandleAudioTests(unittest.TestCase):
                 f"<i>{FIRST_TRANSCRIPT_STATUS}</i>",
                 f"<i>{SECOND_TRANSCRIPT_STATUS}</i>",
                 f"<i>{MERGING_STATUS}</i>",
-                f"<i>{SUMMARY_STATUS}</i>",
+                f"<i>{TITLE_STATUS}</i>",
             ],
         )
         bot._post.assert_awaited_once()
@@ -679,7 +680,7 @@ class HandleAudioTests(unittest.TestCase):
     @patch(
         "bot.transcribe_recording",
         new_callable=AsyncMock,
-        return_value=("final text", "Specific summary"),
+        return_value=("final text", "Specific title"),
     )
     @patch("bot.recording_paths")
     def test_status_creation_failure_still_delivers_successful_transcript(
@@ -743,10 +744,10 @@ class HandleAudioTests(unittest.TestCase):
                     FIRST_TRANSCRIPT_STATUS,
                     SECOND_TRANSCRIPT_STATUS,
                     MERGING_STATUS,
-                    SUMMARY_STATUS,
+                    TITLE_STATUS,
                 ):
                     await progress(stage)
-                return "final text", "Specific summary"
+                return "final text", "Specific title"
 
             transcribe_recording.side_effect = transcribe
             asyncio.run(handle_audio(update, context))
@@ -790,7 +791,7 @@ class HandleAudioTests(unittest.TestCase):
                     else:
                         second_started.set()
                     await release.wait()
-                    return "final text", "Specific summary"
+                    return "final text", "Specific title"
 
                 transcribe_recording.side_effect = transcribe
                 first_task = asyncio.create_task(handle_audio(first_update, first_context))
@@ -853,7 +854,7 @@ class HandleAudioTests(unittest.TestCase):
                         second_started.set()
                     await release.wait()
                     transcript = f"transcript for {source.stem}"
-                    return transcript, f"summary for {source.stem}"
+                    return transcript, f"title for {source.stem}"
 
                 transcribe_recording.side_effect = transcribe
                 first_task = asyncio.create_task(handle_audio(first_update, first_context))
@@ -908,7 +909,7 @@ class ApplicationConfigurationTests(unittest.TestCase):
             "INFERENCE_API_KEY": "inference-key",
             "SECONDARY_INFERENCE_API_URL": "https://secondary.example.test",
             "SECONDARY_INFERENCE_API_KEY": "secondary-key",
-            "SUMMARY_MODEL": "summary-model",
+            "TITLE_MODEL": "title-model",
             "SMART_TRANSCRIPTION_SCHEDULING": "false",
         }
         with patch.dict(os.environ, environment, clear=True):
@@ -940,8 +941,8 @@ class ApplicationConfigurationTests(unittest.TestCase):
             "whisper-podlodka-turbo-mlx",
         )
         self.assertEqual(
-            application.bot_data.update.call_args.kwargs["summary_model"],
-            "summary-model",
+            application.bot_data.update.call_args.kwargs["title_model"],
+            "title-model",
         )
         application.run_webhook.assert_called_once()
 
@@ -966,7 +967,7 @@ class ApplicationConfigurationTests(unittest.TestCase):
             "INFERENCE_API_KEY": "inference-key",
             "SECONDARY_INFERENCE_API_URL": "https://secondary.example.test",
             "SECONDARY_INFERENCE_API_KEY": "secondary-key",
-            "SUMMARY_MODEL": "summary-model",
+            "TITLE_MODEL": "title-model",
             "SMART_TRANSCRIPTION_SCHEDULING": "true",
         }
         with patch.dict(os.environ, environment, clear=True):
@@ -1008,8 +1009,8 @@ class UnsupportedMessageTests(unittest.TestCase):
 
 class TranscribeRecordingTests(unittest.TestCase):
     @patch(
-        "bot.summarize_transcript",
-        return_value=({"text": "Specific summary"}, "Specific summary"),
+        "bot.generate_transcript_title",
+        return_value=({"text": "Specific title"}, "Specific title"),
     )
     @patch("bot.merge_transcripts", return_value=({"text": "merged text"}, " merged text "))
     @patch(
@@ -1018,7 +1019,7 @@ class TranscribeRecordingTests(unittest.TestCase):
     )
     @patch("bot.prepare_wav")
     def test_runs_both_engines_and_returns_merged_text(
-        self, prepare_wav, transcribe_audio, merge_transcripts, summarize_transcript
+        self, prepare_wav, transcribe_audio, merge_transcripts, generate_transcript_title
     ) -> None:
         stages = []
 
@@ -1037,7 +1038,7 @@ class TranscribeRecordingTests(unittest.TestCase):
                     Mock(),
                     "secondary-model",
                     "merge-model",
-                    "summary-model",
+                    "title-model",
                     "afconvert",
                     StageLocks(),
                     artifacts_directory,
@@ -1054,17 +1055,17 @@ class TranscribeRecordingTests(unittest.TestCase):
                     "secondary.txt",
                     "merged.json",
                     "merged.txt",
-                    "summary.json",
-                    "summary.txt",
+                    "title.json",
+                    "title.txt",
                 },
             )
             self.assertEqual((artifacts_directory / "merged.txt").read_text(), "merged text\n")
             self.assertEqual(
-                (artifacts_directory / "summary.txt").read_text(),
-                "Specific summary\n",
+                (artifacts_directory / "title.txt").read_text(),
+                "Specific title\n",
             )
 
-        self.assertEqual(result, ("merged text", "Specific summary"))
+        self.assertEqual(result, ("merged text", "Specific title"))
         self.assertEqual(
             stages,
             [
@@ -1072,19 +1073,19 @@ class TranscribeRecordingTests(unittest.TestCase):
                 FIRST_TRANSCRIPT_STATUS,
                 SECOND_TRANSCRIPT_STATUS,
                 MERGING_STATUS,
-                SUMMARY_STATUS,
+                TITLE_STATUS,
             ],
         )
         prepare_wav.assert_called_once()
         self.assertEqual(transcribe_audio.call_count, 2)
         merge_transcripts.assert_called_once()
-        summarize_transcript.assert_called_once()
+        generate_transcript_title.assert_called_once()
 
-    def test_summary_errors_fall_back_to_transcript_prefix(self) -> None:
+    def test_title_errors_fall_back_to_transcript_prefix(self) -> None:
         transcript = "a" * 50 + "hidden"
         for error in (
             AttributeError("malformed provider response"),
-            RuntimeError("unexpected summary failure"),
+            RuntimeError("unexpected title failure"),
         ):
             with self.subTest(error=error.__class__.__name__):
                 with TemporaryDirectory() as directory:
@@ -1100,7 +1101,7 @@ class TranscribeRecordingTests(unittest.TestCase):
                             "bot.merge_transcripts",
                             return_value=({"text": transcript}, transcript),
                         ),
-                        patch("bot.summarize_transcript", side_effect=error),
+                        patch("bot.generate_transcript_title", side_effect=error),
                     ):
                         result = asyncio.run(
                             transcribe_recording(
@@ -1110,7 +1111,7 @@ class TranscribeRecordingTests(unittest.TestCase):
                                 Mock(),
                                 "secondary-model",
                                 "merge-model",
-                                "summary-model",
+                                "title-model",
                                 "afconvert",
                                 StageLocks(),
                             )
@@ -1118,11 +1119,11 @@ class TranscribeRecordingTests(unittest.TestCase):
 
                 self.assertEqual(result, (transcript, "a" * 50))
 
-    def test_summary_artifact_error_uses_fallback(self) -> None:
+    def test_title_artifact_error_uses_fallback(self) -> None:
         transcript = "a" * 50 + "hidden"
 
         def save_artifact(directory, name, response, text):
-            if name == "summary":
+            if name == "title":
                 raise RuntimeError("storage failed")
 
         with TemporaryDirectory() as directory:
@@ -1139,8 +1140,8 @@ class TranscribeRecordingTests(unittest.TestCase):
                     return_value=({"text": transcript}, transcript),
                 ),
                 patch(
-                    "bot.summarize_transcript",
-                    return_value=({"text": "summary"}, "Specific summary"),
+                    "bot.generate_transcript_title",
+                    return_value=({"text": "title"}, "Specific title"),
                 ),
                 patch("bot.save_transcription_artifact", side_effect=save_artifact),
             ):
@@ -1152,7 +1153,7 @@ class TranscribeRecordingTests(unittest.TestCase):
                         Mock(),
                         "secondary-model",
                         "merge-model",
-                        "summary-model",
+                        "title-model",
                         "afconvert",
                         StageLocks(),
                         Path(directory) / "artifacts",
@@ -1161,7 +1162,7 @@ class TranscribeRecordingTests(unittest.TestCase):
 
         self.assertEqual(result, (transcript, "a" * 50))
 
-    def test_summary_cancellation_propagates(self) -> None:
+    def test_title_cancellation_propagates(self) -> None:
         with TemporaryDirectory() as directory:
             source = Path(directory) / "audio.ogg"
             source.touch()
@@ -1176,7 +1177,7 @@ class TranscribeRecordingTests(unittest.TestCase):
                     return_value=({"text": "merged"}, "merged"),
                 ),
                 patch(
-                    "bot.summarize_transcript",
+                    "bot.generate_transcript_title",
                     side_effect=asyncio.CancelledError,
                 ),
             ):
@@ -1189,7 +1190,7 @@ class TranscribeRecordingTests(unittest.TestCase):
                             Mock(),
                             "secondary-model",
                             "merge-model",
-                            "summary-model",
+                            "title-model",
                             "afconvert",
                             StageLocks(),
                         )
@@ -1227,8 +1228,8 @@ class TranscribeRecordingTests(unittest.TestCase):
                         return_value=({"text": "merged"}, "merged"),
                     ),
                     patch(
-                        "bot.summarize_transcript",
-                        return_value=({"text": "summary"}, "summary"),
+                        "bot.generate_transcript_title",
+                        return_value=({"text": "title"}, "title"),
                     ),
                 ):
                     first = asyncio.create_task(
@@ -1239,7 +1240,7 @@ class TranscribeRecordingTests(unittest.TestCase):
                             Mock(),
                             "secondary-model",
                             "merge-model",
-                            "summary-model",
+                            "title-model",
                             "afconvert",
                             stage_locks,
                             scheduler=scheduler,
@@ -1257,7 +1258,7 @@ class TranscribeRecordingTests(unittest.TestCase):
                             Mock(),
                             "secondary-model",
                             "merge-model",
-                            "summary-model",
+                            "title-model",
                             "afconvert",
                             stage_locks,
                             scheduler=scheduler,
@@ -1290,14 +1291,14 @@ class TranscribeRecordingTests(unittest.TestCase):
                         await asyncio.wait_for(
                             asyncio.gather(first, second), timeout=2
                         ),
-                        [("merged", "summary"), ("merged", "summary")],
+                        [("merged", "title"), ("merged", "title")],
                     )
 
         asyncio.run(scenario())
 
     @patch(
-        "bot.summarize_transcript",
-        return_value=({"text": "summary"}, "summary"),
+        "bot.generate_transcript_title",
+        return_value=({"text": "title"}, "title"),
     )
     @patch("bot.merge_transcripts", return_value=({"text": "merged"}, "merged"))
     @patch(
@@ -1306,7 +1307,7 @@ class TranscribeRecordingTests(unittest.TestCase):
     )
     @patch("bot.prepare_wav")
     def test_smart_scheduling_reports_actual_engine_statuses(
-        self, prepare_wav, transcribe_audio, merge_transcripts, summarize_transcript
+        self, prepare_wav, transcribe_audio, merge_transcripts, generate_transcript_title
     ) -> None:
         statuses = []
 
@@ -1324,7 +1325,7 @@ class TranscribeRecordingTests(unittest.TestCase):
                     Mock(),
                     "secondary-model",
                     "merge-model",
-                    "summary-model",
+                    "title-model",
                     "afconvert",
                     StageLocks(),
                     progress=progress,
@@ -1332,7 +1333,7 @@ class TranscribeRecordingTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(result, ("merged", "summary"))
+        self.assertEqual(result, ("merged", "title"))
         self.assertEqual(
             statuses,
             [
@@ -1340,7 +1341,7 @@ class TranscribeRecordingTests(unittest.TestCase):
                 PRIMARY_TRANSCRIPTION_STATUS,
                 SECONDARY_TRANSCRIPTION_STATUS,
                 MERGING_STATUS,
-                SUMMARY_STATUS,
+                TITLE_STATUS,
             ],
         )
 
@@ -1364,7 +1365,7 @@ class TranscribeRecordingTests(unittest.TestCase):
                         Mock(),
                         "secondary-model",
                         "merge-model",
-                        "summary-model",
+                        "title-model",
                         "afconvert",
                         StageLocks(),
                         scheduler=scheduler,
@@ -1387,7 +1388,7 @@ class TranscribeRecordingTests(unittest.TestCase):
                         Mock(),
                         "secondary-model",
                         "merge-model",
-                        "summary-model",
+                        "title-model",
                         "afconvert",
                         StageLocks(),
                     )
@@ -1410,7 +1411,7 @@ class TranscribeRecordingTests(unittest.TestCase):
                     Mock(),
                     "secondary-model",
                     "merge-model",
-                    "summary-model",
+                    "title-model",
                     "afconvert",
                     StageLocks(),
                 )
