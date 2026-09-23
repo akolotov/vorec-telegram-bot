@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import wave
 from pathlib import Path
 from typing import Any
 
@@ -27,11 +28,18 @@ Return only the summary, without a title, quotation marks, Markdown, or explanat
 
 SUMMARY_REQUEST_TIMEOUT = 30
 SUMMARY_MAX_TOKENS = 64
+DEFAULT_MAX_AUDIO_DURATION_SECONDS = 30 * 60
+DEFAULT_AUDIO_CONVERSION_TIMEOUT_SECONDS = 5 * 60
+WAV_SAMPLE_RATE = 16_000
+WAV_SAMPLE_WIDTH_BYTES = 2
+WAV_SIZE_TOLERANCE_BYTES = 64 * 1024
 
 
 def resolve_converter(converter: str) -> str:
     """Return an executable path, using the bundled ffmpeg when needed."""
-    if converter != "ffmpeg" or shutil.which(converter):
+    if converter != "ffmpeg":
+        raise ValueError("only ffmpeg is supported as the audio converter")
+    if shutil.which(converter):
         return converter
 
     import imageio_ffmpeg
@@ -40,41 +48,60 @@ def resolve_converter(converter: str) -> str:
 
 
 def prepare_wav(source: Path, target: Path, converter: str, overwrite: bool) -> None:
+    """Convert audio to bounded mono PCM and reject recordings over 30 minutes."""
     if target.exists() and not overwrite:
         print(f"Using existing WAV: {target}")
         return
     target.parent.mkdir(parents=True, exist_ok=True)
     converter = resolve_converter(converter)
-    if Path(converter).name == "afconvert":
-        command = [
-            converter,
-            "-f",
-            "WAVE",
-            "-d",
-            "LEI16@16000",
-            "-c",
-            "1",
-            "--mix",
-            str(source),
-            str(target),
-        ]
-    else:
-        command = [
-            converter,
-            "-y",
-            "-i",
-            str(source),
-            "-vn",
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-c:a",
-            "pcm_s16le",
-            str(target),
-        ]
+    command = [
+        converter,
+        "-y",
+        "-i",
+        str(source),
+        "-vn",
+        "-t",
+        str(DEFAULT_MAX_AUDIO_DURATION_SECONDS + 1),
+        "-ac",
+        "1",
+        "-ar",
+        str(WAV_SAMPLE_RATE),
+        "-c:a",
+        "pcm_s16le",
+        str(target),
+    ]
     print(f"Preparing WAV: {source} -> {target}")
-    subprocess.run(command, check=True)
+    subprocess.run(
+        command,
+        check=True,
+        timeout=DEFAULT_AUDIO_CONVERSION_TIMEOUT_SECONDS,
+    )
+
+    maximum_size = (
+        (DEFAULT_MAX_AUDIO_DURATION_SECONDS + 1)
+        * WAV_SAMPLE_RATE
+        * WAV_SAMPLE_WIDTH_BYTES
+        + WAV_SIZE_TOLERANCE_BYTES
+    )
+    if target.stat().st_size > maximum_size:
+        raise ValueError("the prepared audio exceeds the safe PCM size limit")
+
+    try:
+        with wave.open(str(target), "rb") as wav_file:
+            if (
+                wav_file.getnchannels() != 1
+                or wav_file.getframerate() != WAV_SAMPLE_RATE
+                or wav_file.getsampwidth() != WAV_SAMPLE_WIDTH_BYTES
+            ):
+                raise ValueError("the prepared audio has an unexpected WAV format")
+            frame_count = wav_file.getnframes()
+    except wave.Error as error:
+        raise ValueError("the prepared audio is not a valid WAV file") from error
+
+    if frame_count > DEFAULT_MAX_AUDIO_DURATION_SECONDS * WAV_SAMPLE_RATE:
+        raise ValueError(
+            f"the recording is longer than {DEFAULT_MAX_AUDIO_DURATION_SECONDS // 60} minutes"
+        )
 
 
 def response_dict(response: Any) -> dict:

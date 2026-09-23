@@ -1,7 +1,9 @@
 import asyncio
 import os
+import subprocess
 import threading
 import unittest
+import wave
 from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -42,6 +44,8 @@ from bot import (
 )
 from telegram.error import BadRequest, NetworkError, TimedOut
 from vorec.audio import (
+    DEFAULT_AUDIO_CONVERSION_TIMEOUT_SECONDS,
+    DEFAULT_MAX_AUDIO_DURATION_SECONDS,
     SUMMARY_MAX_TOKENS,
     SUMMARY_REQUEST_TIMEOUT,
     prepare_wav,
@@ -897,11 +901,14 @@ class ApplicationConfigurationTests(unittest.TestCase):
     ) -> None:
         application = Mock()
         builder = application_builder.return_value
-        builder.token.return_value.concurrent_updates.return_value.build.return_value = application
+        concurrent_builder = builder.token.return_value.updater.return_value.concurrent_updates
+        concurrent_builder.return_value.build.return_value = application
         environment = {
             "TELEGRAM_BOT_TOKEN": "token",
             "ALLOWED_USER_IDS": "123",
+            "TRANSCRIPTION_API_CREDENTIALS": "123:api-token",
             "WEBHOOK_PUBLIC_BASE_URL": "https://funnel.example.ts.net",
+            "WEBHOOK_DOCKER_ALIAS": "bot",
             "WEBHOOK_PATH": "/hooks/bot/telegram/webhook",
             "WEBHOOK_SECRET_TOKEN": "secret-token",
             "INFERENCE_API_URL": "https://inference.example.test",
@@ -911,7 +918,7 @@ class ApplicationConfigurationTests(unittest.TestCase):
             "SUMMARY_MODEL": "summary-model",
             "SMART_TRANSCRIPTION_SCHEDULING": "false",
         }
-        with patch.dict(os.environ, environment, clear=True):
+        with patch.dict(os.environ, environment, clear=True), patch("bot.uvicorn.run"):
             main()
 
         openai.assert_has_calls(
@@ -929,7 +936,8 @@ class ApplicationConfigurationTests(unittest.TestCase):
             ],
             any_order=True,
         )
-        builder.token.return_value.concurrent_updates.assert_called_once_with(True)
+        builder.token.return_value.updater.assert_called_once_with(None)
+        concurrent_builder.assert_called_once_with(True)
         self.assertIsNone(
             application.bot_data.update.call_args.kwargs["transcription_scheduler"]
         )
@@ -943,7 +951,6 @@ class ApplicationConfigurationTests(unittest.TestCase):
             application.bot_data.update.call_args.kwargs["summary_model"],
             "summary-model",
         )
-        application.run_webhook.assert_called_once()
 
     @patch("bot.shutil.which", return_value="/usr/bin/ffmpeg")
     @patch("bot.resolve_converter", return_value="ffmpeg")
@@ -955,11 +962,14 @@ class ApplicationConfigurationTests(unittest.TestCase):
     ) -> None:
         application = Mock()
         builder = application_builder.return_value
-        builder.token.return_value.concurrent_updates.return_value.build.return_value = application
+        concurrent_builder = builder.token.return_value.updater.return_value.concurrent_updates
+        concurrent_builder.return_value.build.return_value = application
         environment = {
             "TELEGRAM_BOT_TOKEN": "token",
             "ALLOWED_USER_IDS": "123",
+            "TRANSCRIPTION_API_CREDENTIALS": "123:api-token",
             "WEBHOOK_PUBLIC_BASE_URL": "https://funnel.example.ts.net",
+            "WEBHOOK_DOCKER_ALIAS": "bot",
             "WEBHOOK_PATH": "/hooks/bot/telegram/webhook",
             "WEBHOOK_SECRET_TOKEN": "secret-token",
             "INFERENCE_API_URL": "https://inference.example.test",
@@ -969,7 +979,7 @@ class ApplicationConfigurationTests(unittest.TestCase):
             "SUMMARY_MODEL": "summary-model",
             "SMART_TRANSCRIPTION_SCHEDULING": "true",
         }
-        with patch.dict(os.environ, environment, clear=True):
+        with patch.dict(os.environ, environment, clear=True), patch("bot.uvicorn.run"):
             main()
 
         self.assertIsInstance(
@@ -1637,34 +1647,70 @@ class AudioConversionTests(unittest.TestCase):
     @patch("vorec.audio.resolve_converter", return_value="ffmpeg")
     @patch("vorec.audio.subprocess.run")
     def test_uses_ffmpeg_by_default_format(self, run, resolve_converter) -> None:
-        source = Path("audio.ogg")
-        target = Path("prepared.wav")
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / "audio.ogg"
+            target = Path(directory) / "prepared.wav"
 
-        prepare_wav(source, target, "ffmpeg", overwrite=True)
+            def create_wav(*args, **kwargs) -> None:
+                with wave.open(str(target), "wb") as output:
+                    output.setnchannels(1)
+                    output.setsampwidth(2)
+                    output.setframerate(16_000)
+                    output.writeframes(b"\x00\x00")
+
+            run.side_effect = create_wav
+            prepare_wav(source, target, "ffmpeg", overwrite=True)
 
         resolve_converter.assert_called_once_with("ffmpeg")
         run.assert_called_once_with(
             [
-                "ffmpeg", "-y", "-i", "audio.ogg", "-vn", "-ac", "1", "-ar", "16000",
-                "-c:a", "pcm_s16le", "prepared.wav",
+                "ffmpeg", "-y", "-i", str(source), "-vn", "-t",
+                str(DEFAULT_MAX_AUDIO_DURATION_SECONDS + 1), "-ac", "1", "-ar", "16000",
+                "-c:a", "pcm_s16le", str(target),
             ],
             check=True,
+            timeout=DEFAULT_AUDIO_CONVERSION_TIMEOUT_SECONDS,
         )
 
+    def test_rejects_afconvert(self) -> None:
+        with self.assertRaisesRegex(ValueError, "only ffmpeg"):
+            resolve_converter("afconvert")
+
+    @patch("vorec.audio.resolve_converter", return_value="ffmpeg")
     @patch("vorec.audio.subprocess.run")
-    def test_keeps_afconvert_compatibility(self, run) -> None:
-        source = Path("audio.ogg")
-        target = Path("prepared.wav")
-
-        prepare_wav(source, target, "afconvert", overwrite=True)
-
-        run.assert_called_once_with(
-            [
-                "afconvert", "-f", "WAVE", "-d", "LEI16@16000", "-c", "1", "--mix",
-                "audio.ogg", "prepared.wav",
-            ],
-            check=True,
+    @patch("vorec.audio.wave.open")
+    def test_rejects_audio_longer_than_thirty_minutes(
+        self, open_wav, run, resolve_converter
+    ) -> None:
+        wav_file = open_wav.return_value.__enter__.return_value
+        wav_file.getnchannels.return_value = 1
+        wav_file.getframerate.return_value = 16_000
+        wav_file.getsampwidth.return_value = 2
+        wav_file.getnframes.return_value = (
+            DEFAULT_MAX_AUDIO_DURATION_SECONDS * 16_000 + 1
         )
+
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / "audio.ogg"
+            target = Path(directory) / "prepared.wav"
+            run.side_effect = lambda *args, **kwargs: target.touch()
+            with self.assertRaisesRegex(ValueError, "longer than 30 minutes"):
+                prepare_wav(source, target, "ffmpeg", overwrite=True)
+
+    @patch("vorec.audio.resolve_converter", return_value="ffmpeg")
+    @patch(
+        "vorec.audio.subprocess.run",
+        side_effect=subprocess.TimeoutExpired("ffmpeg", 300),
+    )
+    def test_propagates_ffmpeg_timeout(self, run, resolve_converter) -> None:
+        with TemporaryDirectory() as directory:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                prepare_wav(
+                    Path(directory) / "audio.ogg",
+                    Path(directory) / "prepared.wav",
+                    "ffmpeg",
+                    overwrite=True,
+                )
 
 
 if __name__ == "__main__":
