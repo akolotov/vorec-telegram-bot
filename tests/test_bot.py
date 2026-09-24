@@ -1805,7 +1805,8 @@ class AudioConversionTests(unittest.TestCase):
         resolve_converter.assert_called_once_with("ffmpeg")
         run.assert_called_once_with(
             [
-                "ffmpeg", "-y", "-i", "audio.ogg", "-vn", "-ac", "1", "-ar", "16000",
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats",
+                "-y", "-i", "audio.ogg", "-vn", "-ac", "1", "-ar", "16000",
                 "-c:a", "pcm_s16le", "prepared.wav",
             ],
             check=True,

@@ -61,6 +61,10 @@ def prepare_wav(source: Path, target: Path, converter: str, overwrite: bool) -> 
     else:
         command = [
             converter,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostats",
             "-y",
             "-i",
             str(source),
