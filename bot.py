@@ -12,6 +12,7 @@ import subprocess
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypeVar
 from urllib.parse import urlparse
@@ -32,6 +33,7 @@ from vorec.audio import (
     transcribe_audio,
 )
 from vorec.scheduling import TranscriptionResource, TranscriptionScheduler
+from vorec.storage import TranscriptRecord, TranscriptStorageError, TranscriptStore
 
 
 ENV_FILE = Path(".env")
@@ -61,6 +63,7 @@ DELIVERY_FAILED_TEXT = "The transcript was created, but it could not be delivere
 DELIVERY_UNCONFIRMED_TEXT = (
     "The transcript was created, but its delivery could not be confirmed."
 )
+STORAGE_FAILED_TEXT = "The transcript was created, but it could not be saved."
 DELIVERY_RETRY_DELAYS = (1, 2)
 DEFAULT_WEBHOOK_LISTEN = "0.0.0.0"
 DEFAULT_WEBHOOK_PORT = 8080
@@ -679,6 +682,23 @@ def save_transcription_artifact(
     (artifacts_directory / f"{name}.txt").write_text(text.strip() + "\n", encoding="utf-8")
 
 
+def utc_timestamp(value: datetime) -> str:
+    """Return one Telegram timestamp normalized to second-resolution UTC."""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def relative_data_path(path: Path, data_directory: Path) -> str:
+    """Return a portable POSIX path below the configured data directory."""
+    try:
+        return path.relative_to(data_directory).as_posix()
+    except ValueError as error:
+        raise TranscriptStorageError(
+            f"Artifact path is outside the data directory: {path}"
+        ) from error
+
+
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     user = update.effective_user
@@ -689,6 +709,10 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     attachment = message.voice or message.audio or message.document
     if attachment is None:
         return
+
+    data_directory: Path = context.application.bot_data.get(
+        "data_directory", DATA_DIRECTORY
+    )
 
     status_message = None
     try:
@@ -701,7 +725,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         LOGGER.warning("Could not create transcription status (%s).", error.__class__.__name__)
 
     try:
-        source, artifacts_directory = recording_paths(message)
+        source, artifacts_directory = recording_paths(message, data_directory)
         source.parent.mkdir(parents=True, exist_ok=True)
         try:
             LOGGER.info("Downloading Telegram audio.")
@@ -729,14 +753,34 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             report_progress,
             scheduler=context.application.bot_data["transcription_scheduler"],
         )
+        transcript_store: TranscriptStore = context.application.bot_data[
+            "transcript_store"
+        ]
+        transcript_store.save(
+            TranscriptRecord(
+                telegram_user_id=user.id,
+                telegram_chat_id=message.chat_id,
+                telegram_message_id=message.message_id,
+                created_at=utc_timestamp(message.date),
+                title=title,
+                text=transcript,
+                source_audio_path=relative_data_path(source, data_directory),
+                artifacts_dir=relative_data_path(
+                    artifacts_directory, data_directory
+                ),
+            )
+        )
     except Exception as error:
         LOGGER.exception("Failed to process audio from Telegram user %s", user.id)
-        reason = (
-            str(error).strip()
-            if isinstance(error, TranscriptionError)
-            else f"An unexpected internal error occurred ({error.__class__.__name__})."
-        )
-        error_text = f"Could not transcribe the audio: {reason}"
+        if isinstance(error, TranscriptStorageError):
+            error_text = STORAGE_FAILED_TEXT
+        else:
+            reason = (
+                str(error).strip()
+                if isinstance(error, TranscriptionError)
+                else f"An unexpected internal error occurred ({error.__class__.__name__})."
+            )
+            error_text = f"Could not transcribe the audio: {reason}"
         if status_message is not None and await edit_italic_status(
             status_message, error_text[:600]
         ):
@@ -804,6 +848,8 @@ def main() -> None:
         timeout=600,
     )
     scheduler = TranscriptionScheduler() if smart_scheduling else None
+    transcript_store = TranscriptStore(DATA_DIRECTORY / "vorec.sqlite3")
+    transcript_store.initialize()
 
     audio_messages = filters.VOICE | filters.AUDIO | filters.Document.Category("audio/")
     app = ApplicationBuilder().token(token).concurrent_updates(True).build()
@@ -820,6 +866,8 @@ def main() -> None:
         title_model=os.getenv("TITLE_MODEL", DEFAULT_TITLE_MODEL),
         converter=converter,
         transcription_scheduler=scheduler,
+        transcript_store=transcript_store,
+        data_directory=DATA_DIRECTORY,
     )
     app.add_handler(MessageHandler(filters.User(user_id=user_ids) & audio_messages, handle_audio))
     app.add_handler(
