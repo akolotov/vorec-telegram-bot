@@ -80,6 +80,29 @@ class TranscriptImportTests(unittest.TestCase):
 
         self.assertEqual(plan.records[0].title, "M" * 50)
 
+    def test_ignores_incomplete_transcript_directory(self) -> None:
+        with TemporaryDirectory() as directory:
+            data = Path(directory)
+            self.add_recording(data, "2026-09-23_10-20-30_222_333")
+            incomplete_id = "2026-09-23_10-21-30_222_334"
+            incomplete = data / "transcripts" / "2026-09" / incomplete_id
+            incomplete.mkdir(parents=True)
+            (incomplete / "primary.txt").write_text("partial\n", encoding="utf-8")
+            (data / "voices" / "2026-09" / f"{incomplete_id}.ogg").touch()
+
+            plan = collect_records(data, user_id=111, chat_id=222)
+
+        self.assertEqual(len(plan.records), 1)
+        self.assertEqual(plan.orphan_audio_count, 1)
+
+    def test_rejects_invalid_calendar_timestamp(self) -> None:
+        with TemporaryDirectory() as directory:
+            data = Path(directory)
+            self.add_recording(data, "2026-02-31_10-20-30_222_333")
+
+            with self.assertRaisesRegex(ArchiveImportError, "invalid timestamp"):
+                collect_records(data, user_id=111, chat_id=222)
+
     def test_rejects_archive_before_writing_when_any_record_is_invalid(self) -> None:
         with TemporaryDirectory() as directory:
             data = Path(directory)

@@ -53,6 +53,8 @@ def collect_records(data_directory: Path, user_id: int, chat_id: int) -> ImportP
     records: list[TranscriptRecord] = []
     used_sources: set[Path] = set()
     for artifacts_directory in artifact_directories:
+        if not (artifacts_directory / "merged.txt").exists():
+            continue
         record = _record_from_directory(
             data_directory,
             artifacts_directory,
@@ -105,11 +107,16 @@ def _record_from_directory(
         raise ArchiveImportError(
             f"Transcript directory {name!r} is stored under the wrong month."
         )
-    created_at = (
-        datetime.strptime(timestamp, "%Y-%m-%d_%H-%M-%S")
-        .replace(tzinfo=timezone.utc)
-        .isoformat(timespec="seconds")
-    )
+    try:
+        created_at = (
+            datetime.strptime(timestamp, "%Y-%m-%d_%H-%M-%S")
+            .replace(tzinfo=timezone.utc)
+            .isoformat(timespec="seconds")
+        )
+    except ValueError as error:
+        raise ArchiveImportError(
+            f"Transcript directory {name!r} contains an invalid timestamp."
+        ) from error
 
     text = _read_nonempty(artifacts_directory / "merged.txt", "merged transcript")
     title_path = artifacts_directory / "title.txt"
