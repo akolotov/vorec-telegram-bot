@@ -120,6 +120,12 @@ checks its signature and one-hour lifetime, then reads only rows owned by the
 signed Telegram user ID. Full transcript text is fetched only after opening a
 title. The Mini App never edits transcripts or tags.
 
+The HTTP server writes access logs for Mini App pages, assets, API requests,
+and Telegram webhooks. Each entry contains the client address seen by the
+server, the method, the path and query string, and the response status. It
+does not contain request headers or response bodies. Keep these logs private:
+detail paths contain transcript IDs, and list queries contain the timezone.
+
 Tags are personal to a user. Their stored names are lowercase without `#`, and
 the `#` prefix is added in the UI. Another process may populate tags later;
 until then, the tag view shows an **Uncategorized** group. A database upgrade from

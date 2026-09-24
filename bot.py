@@ -978,7 +978,7 @@ def main() -> None:
         web_application,
         host=webhook_listen,
         port=webhook_port,
-        access_log=False,
+        access_log=True,
     )
 
 

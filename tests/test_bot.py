@@ -1085,7 +1085,12 @@ class ApplicationConfigurationTests(unittest.TestCase):
             transcript_store.return_value,
         )
         create_web_application.assert_called_once()
-        uvicorn_run.assert_called_once()
+        uvicorn_run.assert_called_once_with(
+            create_web_application.return_value,
+            host="0.0.0.0",
+            port=8080,
+            access_log=True,
+        )
 
     @patch("bot.uvicorn.run")
     @patch("bot.create_web_application")
