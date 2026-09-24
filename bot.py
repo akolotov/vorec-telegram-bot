@@ -200,7 +200,7 @@ async def set_personal_menu_button(bot, user_id: int, app_url: str) -> None:
     try:
         await bot.set_chat_menu_button(
             chat_id=user_id,
-            menu_button=MenuButtonWebApp("Транскрипты", WebAppInfo(app_url)),
+            menu_button=MenuButtonWebApp("Memos", WebAppInfo(app_url)),
         )
     except Exception as error:
         LOGGER.warning(

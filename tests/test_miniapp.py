@@ -213,8 +213,14 @@ class MiniAppWebTests(unittest.TestCase):
             init_data = signed_data([("auth_date", str(int(time.time()))), ("user", '{"id":101}')])
             headers = {"X-Telegram-Init-Data": init_data}
             with TestClient(web) as client:
-                self.assertEqual(client.get("/apps/bot/").status_code, 200)
-                self.assertEqual(client.get("/apps/bot/app.js").status_code, 200)
+                page = client.get("/apps/bot/")
+                self.assertEqual(page.status_code, 200)
+                for label in ("Memos", "By Date", "By Categories", "← Back"):
+                    self.assertIn(label, page.text)
+                self.assertNotIn("Ваши заметки", page.text)
+                script = client.get("/apps/bot/app.js")
+                self.assertEqual(script.status_code, 200)
+                self.assertIn("Uncategorized", script.text)
                 self.assertEqual(client.get("/apps/bot/styles.css").status_code, 200)
                 self.assertEqual(client.get("/apps/bot/api/groups?view=date").status_code, 401)
                 response = client.get("/apps/bot/api/groups?view=date&timezone=UTC", headers=headers)

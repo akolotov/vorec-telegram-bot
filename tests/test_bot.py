@@ -252,7 +252,7 @@ class MiniAppConfigurationTests(unittest.TestCase):
             await ensure_menu_on_first_message(update, context)
             bot.set_chat_menu_button.assert_awaited_once()
             button = bot.set_chat_menu_button.await_args.kwargs["menu_button"]
-            self.assertEqual(button.text, "Транскрипты")
+            self.assertEqual(button.text, "Memos")
             self.assertEqual(button.web_app.url, "https://funnel.example.ts.net/apps/bot/")
 
         asyncio.run(scenario())

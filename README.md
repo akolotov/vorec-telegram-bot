@@ -102,17 +102,18 @@ the path must match `/apps/<WEBHOOK_DOCKER_ALIAS>/`. For existing deployments,
 and `MINI_APP_PATH` defaults to the alias-based route when omitted. The separate
 `MINI_APP_PUBLIC_URL` setting is no longer used.
 
-On startup, the bot sets a personal **Транскрипты** menu button for every
+On startup, the bot sets a personal **Memos** menu button for every
 allowed user. If Telegram rejects an initial attempt before a
 user has opened the private chat, the bot retries when that user next sends a
 private message.
 
-## Transcript Mini App
+## Memos Mini App
 
 Open the bot's menu button in a private Telegram chat. The Mini App starts with
-transcripts grouped by local date; switch to **По тегам** for greedy, disjoint
-tag groups. Each title opens the complete text. The UI is in Russian and
-adapts to Telegram's light and dark themes.
+transcripts grouped by local date; switch to **By Categories** for greedy, disjoint
+tag groups. Each title opens the complete text. Navigation labels are in
+English, while dates and status messages remain in Russian. The UI adapts to
+Telegram's light and dark themes.
 
 The browser sends Telegram's raw `initData` on each read request. The server
 checks its signature and one-hour lifetime, then reads only rows owned by the
@@ -121,7 +122,7 @@ title. The Mini App never edits transcripts or tags.
 
 Tags are personal to a user. Their stored names are lowercase without `#`, and
 the `#` prefix is added in the UI. Another process may populate tags later;
-until then, the tag view shows a **Без тегов** group. A database upgrade from
+until then, the tag view shows an **Uncategorized** group. A database upgrade from
 schema version 2 expects both tag tables to be empty and stops safely if it
 finds existing tag data.
 

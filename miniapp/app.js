@@ -65,7 +65,7 @@
   function renderGroups(groups) {
     groupsElement.replaceChildren();
     if (!groups.length) {
-      listStatus.textContent = "Транскриптов пока нет.";
+      listStatus.textContent = "Заметок пока нет.";
       return;
     }
     listStatus.textContent = "";
@@ -76,7 +76,7 @@
       heading.className = "group-title";
       heading.textContent = currentView === "date"
         ? formatDay(group.key)
-        : group.untagged ? "Без тегов" : `#${group.tag}`;
+        : group.untagged ? "Uncategorized" : `#${group.tag}`;
       section.append(heading);
       group.items.forEach((item) => {
         const button = document.createElement("button");
