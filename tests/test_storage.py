@@ -8,6 +8,7 @@ from vorec.storage import (
     TranscriptRecord,
     TranscriptStorageError,
     TranscriptStore,
+    normalize_tag_name,
 )
 
 
@@ -60,15 +61,21 @@ class TranscriptStoreTests(unittest.TestCase):
 
         self.assertEqual(version, SCHEMA_VERSION)
         self.assertEqual(transcript_columns["telegram_message_id"], 0)
-        self.assertEqual(tag_columns, {"id": 0, "name": 1, "description": 1})
+        self.assertEqual(
+            tag_columns,
+            {"id": 0, "telegram_user_id": 1, "name": 1, "description": 1},
+        )
         self.assertIn("ix_transcripts_user_created", transcript_indexes)
         self.assertIn("ix_transcripts_created", transcript_indexes)
+        self.assertIn("ux_transcripts_id_user", transcript_indexes)
         self.assertIn("ix_transcript_tags_tag", transcript_tag_indexes)
         self.assertEqual(
             foreign_keys,
             {
                 ("transcripts", "transcript_id", "id", "CASCADE"),
+                ("transcripts", "telegram_user_id", "telegram_user_id", "CASCADE"),
                 ("tags", "tag_id", "id", "CASCADE"),
+                ("tags", "telegram_user_id", "telegram_user_id", "CASCADE"),
             },
         )
 
@@ -133,17 +140,17 @@ class TranscriptStoreTests(unittest.TestCase):
                     "SELECT id FROM transcripts"
                 ).fetchone()[0]
                 tag_id = connection.execute(
-                    "INSERT INTO tags (name, description) VALUES (?, ?)",
-                    ("Projects", "Notes about work on a specific project."),
+                    "INSERT INTO tags (telegram_user_id, name, description) VALUES (?, ?, ?)",
+                    (101, "projects", "Notes about work on a specific project."),
                 ).lastrowid
                 connection.execute(
-                    "INSERT INTO transcript_tags (transcript_id, tag_id) VALUES (?, ?)",
-                    (transcript_id, tag_id),
+                    "INSERT INTO transcript_tags (transcript_id, tag_id, telegram_user_id) VALUES (?, ?, ?)",
+                    (transcript_id, tag_id, 101),
                 )
                 with self.assertRaises(sqlite3.IntegrityError):
                     connection.execute(
-                        "INSERT INTO transcript_tags (transcript_id, tag_id) VALUES (?, ?)",
-                        (transcript_id, tag_id),
+                        "INSERT INTO transcript_tags (transcript_id, tag_id, telegram_user_id) VALUES (?, ?, ?)",
+                        (transcript_id, tag_id, 101),
                     )
                 connection.execute("DELETE FROM tags WHERE id = ?", (tag_id,))
                 associations = connection.execute(
@@ -152,11 +159,127 @@ class TranscriptStoreTests(unittest.TestCase):
 
                 with self.assertRaises(sqlite3.IntegrityError):
                     connection.execute(
-                        "INSERT INTO tags (name, description) VALUES (?, ?)",
-                        ("Empty description", "   "),
+                        "INSERT INTO tags (telegram_user_id, name, description) VALUES (?, ?, ?)",
+                        (101, "empty-description", "   "),
                     )
 
         self.assertEqual(associations, [])
+
+    def test_personal_tags_and_composite_foreign_keys(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = TranscriptStore(Path(directory) / "vorec.sqlite3")
+            store.initialize()
+            store.save(transcript_record())
+            store.save(
+                transcript_record(
+                    telegram_user_id=202,
+                    telegram_chat_id=404,
+                    telegram_message_id=505,
+                    source_audio_path="voices/other.ogg",
+                    artifacts_dir="transcripts/other",
+                )
+            )
+            with store._connect() as connection:
+                first_id, second_id = [
+                    row[0] for row in connection.execute("SELECT id FROM transcripts ORDER BY id")
+                ]
+                first_tag = store.create_tag(101, " #WORK ", "Work notes").id
+                second_tag = store.create_tag(202, "work", "Work notes").id
+                self.assertEqual(
+                    connection.execute("SELECT name FROM tags WHERE id = ?", (first_tag,)).fetchone()[0],
+                    "work",
+                )
+                with self.assertRaises(TranscriptStorageError):
+                    store.create_tag(101, "Work", "Duplicate")
+                connection.execute(
+                    "INSERT INTO transcript_tags VALUES (?, ?, 101)", (first_id, first_tag)
+                )
+                connection.execute(
+                    "INSERT INTO transcript_tags VALUES (?, ?, 202)", (second_id, second_tag)
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        "INSERT INTO transcript_tags VALUES (?, ?, 101)",
+                        (first_id, second_tag),
+                    )
+                self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
+                connection.execute("DELETE FROM transcripts WHERE id = ?", (first_id,))
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM transcript_tags").fetchone()[0],
+                    1,
+                )
+
+    def test_migrates_empty_version_two_tags_and_refuses_nonempty_tags(self) -> None:
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / "vorec.sqlite3"
+            store = TranscriptStore(database)
+            store.initialize()
+            store.save(transcript_record())
+            with sqlite3.connect(database) as connection:
+                connection.executescript(
+                    """DROP TABLE transcript_tags;
+                    DROP TABLE tags;
+                    CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL,
+                        description TEXT NOT NULL);
+                    CREATE TABLE transcript_tags (transcript_id INTEGER, tag_id INTEGER);
+                    PRAGMA user_version = 2;"""
+                )
+                connection.execute(
+                    "INSERT INTO tags (name, description) VALUES ('old', 'Old tag')"
+                )
+            with self.assertRaisesRegex(TranscriptStorageError, "cannot be migrated"):
+                store.initialize()
+            with sqlite3.connect(database) as connection:
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 2)
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM tags").fetchone()[0], 1)
+                connection.execute("DELETE FROM tags")
+            store.initialize()
+            with sqlite3.connect(database) as connection:
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 3)
+                self.assertEqual(
+                    connection.execute("SELECT title FROM transcripts").fetchone()[0],
+                    "Specific title",
+                )
+                self.assertEqual(
+                    connection.execute("PRAGMA table_info(tags)").fetchall()[1][1],
+                    "telegram_user_id",
+                )
+
+    def test_reads_only_own_transcripts_and_tags(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = TranscriptStore(Path(directory) / "vorec.sqlite3")
+            store.initialize()
+            store.save(transcript_record())
+            store.save(
+                transcript_record(
+                    telegram_user_id=202,
+                    telegram_chat_id=404,
+                    telegram_message_id=505,
+                    title="Other title",
+                    source_audio_path="voices/other.ogg",
+                    artifacts_dir="transcripts/other",
+                )
+            )
+            with store._connect() as connection:
+                own_id = connection.execute(
+                    "SELECT id FROM transcripts WHERE telegram_user_id = 101"
+                ).fetchone()[0]
+                other_id = connection.execute(
+                    "SELECT id FROM transcripts WHERE telegram_user_id = 202"
+                ).fetchone()[0]
+                tag_id = connection.execute(
+                    "INSERT INTO tags (telegram_user_id, name, description) VALUES (101, 'work', 'Work')"
+                ).lastrowid
+                connection.execute(
+                    "INSERT INTO transcript_tags VALUES (?, ?, 101)", (own_id, tag_id)
+                )
+            summaries = store.list_for_user(101)
+            detail = store.get_for_user(own_id, 101)
+            self.assertEqual([item.id for item in summaries], [own_id])
+            self.assertEqual([tag.name for tag in summaries[0].tags], ["work"])
+            self.assertEqual(detail.text, "Completed transcript")
+            self.assertIsNone(store.get_for_user(other_id, 101))
+            self.assertEqual(normalize_tag_name(" #WOrK "), "work")
 
     def test_saves_legacy_record_and_updates_it_by_source_path(self) -> None:
         with TemporaryDirectory() as directory:

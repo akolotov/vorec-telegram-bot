@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class TranscriptStorageError(RuntimeError):
@@ -29,6 +29,33 @@ class TranscriptRecord:
     artifacts_dir: str
 
 
+@dataclass(frozen=True)
+class TagRecord:
+    id: int
+    name: str
+
+
+@dataclass(frozen=True)
+class TranscriptSummary:
+    id: int
+    created_at: str
+    title: str
+    tags: tuple[TagRecord, ...]
+
+
+@dataclass(frozen=True)
+class TranscriptDetail(TranscriptSummary):
+    text: str
+
+
+def normalize_tag_name(name: str) -> str:
+    """Return a personal tag's canonical name without its display prefix."""
+    normalized = name.strip().lstrip("#").strip().casefold()
+    if not normalized:
+        raise ValueError("A tag name must not be empty.")
+    return normalized
+
+
 class TranscriptStore:
     """Store completed transcripts in one local SQLite database."""
 
@@ -40,52 +67,82 @@ class TranscriptStore:
         try:
             self.database_path.parent.mkdir(parents=True, exist_ok=True)
             with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
                 version = connection.execute("PRAGMA user_version").fetchone()[0]
                 if version > SCHEMA_VERSION:
                     raise TranscriptStorageError(
                         f"Database schema version {version} is newer than supported "
                         f"version {SCHEMA_VERSION}."
                     )
-                connection.executescript(
-                    """
-                    CREATE TABLE IF NOT EXISTS transcripts (
-                        id                  INTEGER PRIMARY KEY,
-                        telegram_user_id    INTEGER NOT NULL,
-                        telegram_chat_id    INTEGER NOT NULL,
+                connection.execute(
+                    """CREATE TABLE IF NOT EXISTS transcripts (
+                        id INTEGER PRIMARY KEY,
+                        telegram_user_id INTEGER NOT NULL,
+                        telegram_chat_id INTEGER NOT NULL,
                         telegram_message_id INTEGER,
-                        created_at          TEXT NOT NULL,
-                        title               TEXT NOT NULL,
-                        text                TEXT NOT NULL,
-                        source_audio_path   TEXT NOT NULL UNIQUE,
-                        artifacts_dir       TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        title TEXT NOT NULL,
+                        text TEXT NOT NULL,
+                        source_audio_path TEXT NOT NULL UNIQUE,
+                        artifacts_dir TEXT NOT NULL,
                         UNIQUE (telegram_chat_id, telegram_message_id)
-                    );
+                    )"""
+                )
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS ix_transcripts_user_created "
+                    "ON transcripts (telegram_user_id, created_at DESC)"
+                )
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS ix_transcripts_created "
+                    "ON transcripts (created_at DESC)"
+                )
+                connection.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS ux_transcripts_id_user "
+                    "ON transcripts (id, telegram_user_id)"
+                )
 
-                    CREATE INDEX IF NOT EXISTS ix_transcripts_user_created
-                        ON transcripts (telegram_user_id, created_at DESC);
+                if version < SCHEMA_VERSION:
+                    tables = {
+                        row[0]
+                        for row in connection.execute(
+                            "SELECT name FROM sqlite_master WHERE type = 'table'"
+                        )
+                    }
+                    for table in ("tags", "transcript_tags"):
+                        if table in tables and connection.execute(
+                            f"SELECT 1 FROM {table} LIMIT 1"
+                        ).fetchone() is not None:
+                            raise TranscriptStorageError(
+                                "Existing tags cannot be migrated automatically."
+                            )
+                    connection.execute("DROP TABLE IF EXISTS transcript_tags")
+                    connection.execute("DROP TABLE IF EXISTS tags")
 
-                    CREATE INDEX IF NOT EXISTS ix_transcripts_created
-                        ON transcripts (created_at DESC);
-
-                    CREATE TABLE IF NOT EXISTS tags (
-                        id          INTEGER PRIMARY KEY,
-                        name        TEXT NOT NULL UNIQUE
-                                    CHECK (length(trim(name)) > 0),
-                        description TEXT NOT NULL
-                                    CHECK (length(trim(description)) > 0)
-                    );
-
-                    CREATE TABLE IF NOT EXISTS transcript_tags (
-                        transcript_id INTEGER NOT NULL
-                            REFERENCES transcripts(id) ON DELETE CASCADE,
-                        tag_id        INTEGER NOT NULL
-                            REFERENCES tags(id) ON DELETE CASCADE,
-                        PRIMARY KEY (transcript_id, tag_id)
-                    );
-
-                    CREATE INDEX IF NOT EXISTS ix_transcript_tags_tag
-                        ON transcript_tags (tag_id, transcript_id);
-                    """
+                connection.execute(
+                    """CREATE TABLE IF NOT EXISTS tags (
+                        id INTEGER PRIMARY KEY,
+                        telegram_user_id INTEGER NOT NULL,
+                        name TEXT NOT NULL CHECK (length(trim(name)) > 0),
+                        description TEXT NOT NULL CHECK (length(trim(description)) > 0),
+                        UNIQUE (telegram_user_id, name),
+                        UNIQUE (id, telegram_user_id)
+                    )"""
+                )
+                connection.execute(
+                    """CREATE TABLE IF NOT EXISTS transcript_tags (
+                        transcript_id INTEGER NOT NULL,
+                        tag_id INTEGER NOT NULL,
+                        telegram_user_id INTEGER NOT NULL,
+                        PRIMARY KEY (transcript_id, tag_id),
+                        FOREIGN KEY (transcript_id, telegram_user_id)
+                            REFERENCES transcripts(id, telegram_user_id) ON DELETE CASCADE,
+                        FOREIGN KEY (tag_id, telegram_user_id)
+                            REFERENCES tags(id, telegram_user_id) ON DELETE CASCADE
+                    )"""
+                )
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS ix_transcript_tags_tag "
+                    "ON transcript_tags (tag_id, transcript_id)"
                 )
                 connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         except TranscriptStorageError:
@@ -148,6 +205,87 @@ class TranscriptStore:
             raise TranscriptStorageError(
                 f"Could not save transcript metadata: {error}"
             ) from error
+
+    def create_tag(
+        self, telegram_user_id: int, name: str, description: str
+    ) -> TagRecord:
+        """Persist one canonical personal tag for a future tagging producer."""
+        try:
+            canonical_name = normalize_tag_name(name)
+        except ValueError as error:
+            raise TranscriptStorageError(str(error)) from error
+        description = description.strip()
+        if not description:
+            raise TranscriptStorageError("A tag description must not be empty.")
+        try:
+            with self._connect() as connection:
+                cursor = connection.execute(
+                    "INSERT INTO tags (telegram_user_id, name, description) VALUES (?, ?, ?)",
+                    (telegram_user_id, canonical_name, description),
+                )
+                return TagRecord(cursor.lastrowid, canonical_name)
+        except (OSError, sqlite3.Error) as error:
+            raise TranscriptStorageError("Could not create personal tag.") from error
+
+    def list_for_user(self, telegram_user_id: int) -> list[TranscriptSummary]:
+        """Read a user's transcript metadata and personal tags in one query."""
+        try:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    """SELECT t.id, t.created_at, t.title, tag.id, tag.name
+                    FROM transcripts AS t
+                    LEFT JOIN transcript_tags AS tt
+                        ON tt.transcript_id = t.id
+                    LEFT JOIN tags AS tag ON tag.id = tt.tag_id
+                    WHERE t.telegram_user_id = ?
+                    ORDER BY t.created_at DESC, t.id DESC, tag.name, tag.id""",
+                    (telegram_user_id,),
+                ).fetchall()
+        except (OSError, sqlite3.Error) as error:
+            raise TranscriptStorageError("Could not read transcripts.") from error
+
+        summaries: list[TranscriptSummary] = []
+        for transcript_id, created_at, title, tag_id, tag_name in rows:
+            if not summaries or summaries[-1].id != transcript_id:
+                summaries.append(
+                    TranscriptSummary(transcript_id, created_at, title, ())
+                )
+            if tag_id is not None:
+                current = summaries[-1]
+                summaries[-1] = TranscriptSummary(
+                    current.id,
+                    current.created_at,
+                    current.title,
+                    (*current.tags, TagRecord(tag_id, tag_name)),
+                )
+        return summaries
+
+    def get_for_user(
+        self, transcript_id: int, telegram_user_id: int
+    ) -> TranscriptDetail | None:
+        """Read one transcript only when it belongs to the requested user."""
+        try:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    """SELECT t.id, t.created_at, t.title, t.text, tag.id, tag.name
+                    FROM transcripts AS t
+                    LEFT JOIN transcript_tags AS tt ON tt.transcript_id = t.id
+                    LEFT JOIN tags AS tag ON tag.id = tt.tag_id
+                    WHERE t.id = ? AND t.telegram_user_id = ?
+                    ORDER BY tag.name, tag.id""",
+                    (transcript_id, telegram_user_id),
+                ).fetchall()
+        except (OSError, sqlite3.Error) as error:
+            raise TranscriptStorageError("Could not read transcript.") from error
+        if not rows:
+            return None
+        _, created_at, title, content, _, _ = rows[0]
+        tags = tuple(
+            TagRecord(tag_id, tag_name)
+            for _, _, _, _, tag_id, tag_name in rows
+            if tag_id is not None
+        )
+        return TranscriptDetail(transcript_id, created_at, title, tags, content)
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path, timeout=5)

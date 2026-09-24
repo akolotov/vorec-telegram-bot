@@ -31,14 +31,17 @@ from bot import (
     boolean_env,
     deliver_transcript,
     edit_rich_transcript_message,
+    ensure_menu_on_first_message,
     handle_audio,
     handle_unsupported_message,
     main,
+    mini_app_configuration,
     recording_paths,
     required_env,
     rich_transcript_blocks,
     run_serial_stage,
     send_rich_transcript_reply,
+    set_personal_menu_button,
     transcribe_recording,
     webhook_configuration,
 )
@@ -177,7 +180,7 @@ class PersistentStorageTests(unittest.TestCase):
 class WebhookConfigurationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.environment = {
-            "WEBHOOK_PUBLIC_BASE_URL": "https://funnel.example.ts.net/",
+            "COMMON_PUBLIC_BASE_URL": "https://funnel.example.ts.net/",
             "WEBHOOK_PATH": "/hooks/vorec-telegram-bot/telegram/webhook",
             "WEBHOOK_SECRET_TOKEN": "secret-token",
         }
@@ -200,14 +203,66 @@ class WebhookConfigurationTests(unittest.TestCase):
         )
 
     def test_rejects_non_https_public_url(self) -> None:
-        os.environ["WEBHOOK_PUBLIC_BASE_URL"] = "http://funnel.example.ts.net"
-        with self.assertRaisesRegex(ConfigurationError, "HTTPS URL"):
+        os.environ["COMMON_PUBLIC_BASE_URL"] = "http://funnel.example.ts.net"
+        with self.assertRaisesRegex(ConfigurationError, "HTTPS origin URL"):
             webhook_configuration()
 
     def test_rejects_path_without_leading_slash(self) -> None:
         os.environ["WEBHOOK_PATH"] = "hooks/vorec-telegram-bot/telegram/webhook"
         with self.assertRaisesRegex(ConfigurationError, "start with"):
             webhook_configuration()
+
+
+class MiniAppConfigurationTests(unittest.TestCase):
+    def test_builds_url_from_shared_origin_and_path(self) -> None:
+        environment = {
+            "COMMON_PUBLIC_BASE_URL": "https://funnel.example.ts.net",
+            "WEBHOOK_DOCKER_ALIAS": "bot-test",
+            "MINI_APP_PATH": "/apps/bot-test/",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            self.assertEqual(
+                mini_app_configuration(),
+                ("https://funnel.example.ts.net/apps/bot-test/", "/apps/bot-test/"),
+            )
+            os.environ["MINI_APP_PATH"] = "/apps/other-bot/"
+            with self.assertRaises(ConfigurationError):
+                mini_app_configuration()
+
+    def test_existing_base_url_and_derived_path_still_work(self) -> None:
+        with patch.dict(os.environ, {
+            "WEBHOOK_PUBLIC_BASE_URL": "https://funnel.example.ts.net",
+            "WEBHOOK_DOCKER_ALIAS": "bot-test",
+        }, clear=True):
+            self.assertEqual(
+                mini_app_configuration(),
+                ("https://funnel.example.ts.net/apps/bot-test/", "/apps/bot-test/"),
+            )
+
+    def test_menu_is_configured_once_on_first_private_message(self) -> None:
+        async def scenario():
+            bot = Mock(set_chat_menu_button=AsyncMock())
+            context = Mock(bot=bot)
+            context.application.bot_data = {
+                "mini_app_url": "https://funnel.example.ts.net/apps/bot/",
+                "menu_attempted_users": set(),
+            }
+            update = Mock(effective_user=Mock(id=123), effective_message=Mock(chat_id=123))
+            await ensure_menu_on_first_message(update, context)
+            await ensure_menu_on_first_message(update, context)
+            bot.set_chat_menu_button.assert_awaited_once()
+            button = bot.set_chat_menu_button.await_args.kwargs["menu_button"]
+            self.assertEqual(button.text, "Memos")
+            self.assertEqual(button.web_app.url, "https://funnel.example.ts.net/apps/bot/")
+
+        asyncio.run(scenario())
+
+    def test_menu_failure_does_not_block_bot(self) -> None:
+        bot = Mock(set_chat_menu_button=AsyncMock(side_effect=RuntimeError("unavailable")))
+        asyncio.run(
+            set_personal_menu_button(bot, 123, "https://funnel.example.ts.net/apps/bot/")
+        )
+        bot.set_chat_menu_button.assert_awaited_once()
 
 
 class TranscriptTitleTests(unittest.TestCase):
@@ -955,6 +1010,8 @@ class HandleAudioTests(unittest.TestCase):
 
 
 class ApplicationConfigurationTests(unittest.TestCase):
+    @patch("bot.uvicorn.run")
+    @patch("bot.create_web_application")
     @patch("bot.TranscriptStore")
     @patch("bot.shutil.which", return_value="/usr/bin/ffmpeg")
     @patch("bot.resolve_converter", return_value="ffmpeg")
@@ -969,15 +1026,19 @@ class ApplicationConfigurationTests(unittest.TestCase):
         resolve_converter,
         which,
         transcript_store,
+        create_web_application,
+        uvicorn_run,
     ) -> None:
         application = Mock()
         builder = application_builder.return_value
-        builder.token.return_value.concurrent_updates.return_value.build.return_value = application
+        builder.token.return_value.updater.return_value.concurrent_updates.return_value.build.return_value = application
         environment = {
             "TELEGRAM_BOT_TOKEN": "token",
             "ALLOWED_USER_IDS": "123",
-            "WEBHOOK_PUBLIC_BASE_URL": "https://funnel.example.ts.net",
+            "COMMON_PUBLIC_BASE_URL": "https://funnel.example.ts.net",
             "WEBHOOK_PATH": "/hooks/bot/telegram/webhook",
+            "WEBHOOK_DOCKER_ALIAS": "bot",
+            "MINI_APP_PATH": "/apps/bot/",
             "WEBHOOK_SECRET_TOKEN": "secret-token",
             "INFERENCE_API_URL": "https://inference.example.test",
             "INFERENCE_API_KEY": "inference-key",
@@ -1003,7 +1064,8 @@ class ApplicationConfigurationTests(unittest.TestCase):
             ],
             any_order=True,
         )
-        builder.token.return_value.concurrent_updates.assert_called_once_with(True)
+        builder.token.return_value.updater.return_value.concurrent_updates.assert_called_once_with(True)
+        builder.token.return_value.updater.assert_called_once_with(None)
         self.assertIsNone(
             application.bot_data.update.call_args.kwargs["transcription_scheduler"]
         )
@@ -1022,8 +1084,16 @@ class ApplicationConfigurationTests(unittest.TestCase):
             application.bot_data.update.call_args.kwargs["transcript_store"],
             transcript_store.return_value,
         )
-        application.run_webhook.assert_called_once()
+        create_web_application.assert_called_once()
+        uvicorn_run.assert_called_once_with(
+            create_web_application.return_value,
+            host="0.0.0.0",
+            port=8080,
+            access_log=True,
+        )
 
+    @patch("bot.uvicorn.run")
+    @patch("bot.create_web_application")
     @patch("bot.TranscriptStore")
     @patch("bot.shutil.which", return_value="/usr/bin/ffmpeg")
     @patch("bot.resolve_converter", return_value="ffmpeg")
@@ -1038,15 +1108,19 @@ class ApplicationConfigurationTests(unittest.TestCase):
         resolve_converter,
         which,
         transcript_store,
+        create_web_application,
+        uvicorn_run,
     ) -> None:
         application = Mock()
         builder = application_builder.return_value
-        builder.token.return_value.concurrent_updates.return_value.build.return_value = application
+        builder.token.return_value.updater.return_value.concurrent_updates.return_value.build.return_value = application
         environment = {
             "TELEGRAM_BOT_TOKEN": "token",
             "ALLOWED_USER_IDS": "123",
-            "WEBHOOK_PUBLIC_BASE_URL": "https://funnel.example.ts.net",
+            "COMMON_PUBLIC_BASE_URL": "https://funnel.example.ts.net",
             "WEBHOOK_PATH": "/hooks/bot/telegram/webhook",
+            "WEBHOOK_DOCKER_ALIAS": "bot",
+            "MINI_APP_PATH": "/apps/bot/",
             "WEBHOOK_SECRET_TOKEN": "secret-token",
             "INFERENCE_API_URL": "https://inference.example.test",
             "INFERENCE_API_KEY": "inference-key",

@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>Memos</title>
+  <script src="https://telegram.org/js/telegram-web-app.js?63"></script>
+  <link rel="stylesheet" href="styles.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <main class="page">
+    <section id="list-screen">
+      <header class="header">
+        <h1>Memos</h1>
+        <div class="tabs" role="tablist" aria-label="View">
+          <button id="date-tab" class="tab active" type="button" role="tab" aria-selected="true">By Date</button>
+          <button id="tags-tab" class="tab" type="button" role="tab" aria-selected="false">By Categories</button>
+        </div>
+      </header>
+      <div id="list-status" class="status" role="status"></div>
+      <div id="groups"></div>
+    </section>
+    <section id="detail-screen" hidden>
+      <button id="back-button" class="back-button" type="button">← Back</button>
+      <div id="detail-status" class="status" role="status"></div>
+      <article id="detail" hidden>
+        <p id="detail-date" class="detail-date"></p>
+        <h1 id="detail-title"></h1>
+        <div id="detail-tags" class="tags"></div>
+        <div id="detail-text" class="detail-text"></div>
+      </article>
+    </section>
+  </main>
+</body>
+</html>

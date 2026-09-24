@@ -1,6 +1,8 @@
 # Vorec Telegram Bot
 
-Telegram bot that transcribes allowed users' voice messages and audio files.
+Telegram bot that transcribes allowed users' voice messages and audio files. Its
+read-only Telegram Mini App shows each user's completed transcripts by date or
+personal tag.
 
 ![An Apple Watch with the X-Large face and a single Voice Memos complication](.assets/apple-watch-v8-voice-memo-faces.png)
 
@@ -70,7 +72,9 @@ from `WEBHOOK_DOCKER_ALIAS`; it must match the `<docker-alias>` segment in
 This deployment depends on the shared
 [tailscale-funnel-gateway](https://github.com/akolotov/tailscale-funnel-gateway).
 Deploy that gateway first: it creates the external `tailscale-ingress` Docker
-network and publishes the Funnel hostname used by `WEBHOOK_PUBLIC_BASE_URL`.
+network and publishes the Funnel hostname used by `COMMON_PUBLIC_BASE_URL`.
+Its existing `/apps/<docker-alias>/...` route also forwards the Mini App to this
+container without a gateway configuration change.
 
 Set the matching values in `.env` before deployment. `WEBHOOK_SECRET_TOKEN`
 must be a new random 1-256 character value using only letters, digits,
@@ -85,11 +89,48 @@ to `WEBHOOK_SECRET_TOKEN`:
 ```
 
 ```dotenv
-WEBHOOK_PUBLIC_BASE_URL=https://<funnel-hostname>.<tailnet>.ts.net
+COMMON_PUBLIC_BASE_URL=https://<funnel-hostname>.<tailnet>.ts.net
 WEBHOOK_DOCKER_ALIAS=<docker-alias>
 WEBHOOK_PATH=/hooks/<docker-alias>/<webhook-endpoint>
 WEBHOOK_SECRET_TOKEN=<new-random-secret>
+MINI_APP_PATH=/apps/<docker-alias>/
 ```
+
+The Mini App URL is built from `COMMON_PUBLIC_BASE_URL` and `MINI_APP_PATH`;
+the path must match `/apps/<WEBHOOK_DOCKER_ALIAS>/`. For existing deployments,
+`WEBHOOK_PUBLIC_BASE_URL` remains a fallback when the common setting is absent,
+and `MINI_APP_PATH` defaults to the alias-based route when omitted. The separate
+`MINI_APP_PUBLIC_URL` setting is no longer used.
+
+On startup, the bot sets a personal **Memos** menu button for every
+allowed user. If Telegram rejects an initial attempt before a
+user has opened the private chat, the bot retries when that user next sends a
+private message.
+
+## Memos Mini App
+
+Open the bot's menu button in a private Telegram chat. The Mini App starts with
+transcripts grouped by local date; switch to **By Categories** for greedy, disjoint
+tag groups. Each title opens the complete text. Navigation labels are in
+English, while dates and status messages remain in Russian. The UI adapts to
+Telegram's light and dark themes.
+
+The browser sends Telegram's raw `initData` on each read request. The server
+checks its signature and one-hour lifetime, then reads only rows owned by the
+signed Telegram user ID. Full transcript text is fetched only after opening a
+title. The Mini App never edits transcripts or tags.
+
+The HTTP server writes access logs for Mini App pages, assets, API requests,
+and Telegram webhooks. Each entry contains the client address seen by the
+server, the method, the path and query string, and the response status. It
+does not contain request headers or response bodies. Keep these logs private:
+detail paths contain transcript IDs, and list queries contain the timezone.
+
+Tags are personal to a user. Their stored names are lowercase without `#`, and
+the `#` prefix is added in the UI. Another process may populate tags later;
+until then, the tag view shows an **Uncategorized** group. A database upgrade from
+schema version 2 expects both tag tables to be empty and stops safely if it
+finds existing tag data.
 
 Each deployment must also set a unique `COMPOSE_PROJECT_NAME`. Docker Compose uses this name to
 keep containers from different checkouts separate. A second deployment needs a different
@@ -115,8 +156,8 @@ message ID (`YYYY-MM-DD_HH-MM-SS_<chat-id>_<message-id>`):
 - `data/transcripts/YYYY-MM/<recording-id>/` contains the `primary`, `secondary`, `merged`, and
   successful `title` responses in both `.json` and `.txt` formats.
 - `data/vorec.sqlite3` indexes completed transcripts by Telegram user and creation time. It stores
-  the final text and title together with paths to the audio and artifact directory relative to
-  `data/`.
+  the final text, title, and personal tags together with paths to the audio and artifact
+  directory relative to `data/`.
 
 The intermediate converted WAV is deleted after processing. The `data/` directory is intentionally
 excluded from Git. Incoming messages are handled concurrently, while the bot serializes each

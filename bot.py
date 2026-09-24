@@ -7,6 +7,7 @@ import html
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -18,9 +19,10 @@ from typing import TypeVar
 from urllib.parse import urlparse
 
 import httpx
+import uvicorn
 from dotenv import load_dotenv
 from openai import OpenAI, OpenAIError
-from telegram import Update
+from telegram import MenuButtonWebApp, Update, WebAppInfo
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
@@ -34,6 +36,7 @@ from vorec.audio import (
 )
 from vorec.scheduling import TranscriptionResource, TranscriptionScheduler
 from vorec.storage import TranscriptRecord, TranscriptStorageError, TranscriptStore
+from vorec.miniapp_web import create_web_application
 
 
 ENV_FILE = Path(".env")
@@ -69,6 +72,7 @@ DEFAULT_WEBHOOK_LISTEN = "0.0.0.0"
 DEFAULT_WEBHOOK_PORT = 8080
 DATA_DIRECTORY = Path("data")
 TRANSCRIPT_TITLE_LENGTH = 50
+DOCKER_ALIAS_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]{0,62}\Z")
 
 LOGGER = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -132,14 +136,30 @@ def allowed_user_ids(value: str) -> set[int]:
     return user_ids
 
 
+def common_public_base_url() -> str:
+    """Return the shared HTTPS origin, accepting the old setting during migration."""
+    configured = os.getenv("COMMON_PUBLIC_BASE_URL")
+    if configured is None:
+        configured = os.getenv("WEBHOOK_PUBLIC_BASE_URL")
+    public_base_url = (configured or "").strip().rstrip("/")
+    parsed_url = urlparse(public_base_url)
+    if (
+        parsed_url.scheme != "https"
+        or not parsed_url.netloc
+        or parsed_url.path
+        or parsed_url.params
+        or parsed_url.query
+        or parsed_url.fragment
+    ):
+        raise ConfigurationError("COMMON_PUBLIC_BASE_URL must be an HTTPS origin URL.")
+    return public_base_url
+
+
 def webhook_configuration() -> tuple[str, str, str, int, str]:
     """Return the public and internal settings for the Telegram webhook."""
-    public_base_url = required_env("WEBHOOK_PUBLIC_BASE_URL").rstrip("/")
+    public_base_url = common_public_base_url()
     path = required_env("WEBHOOK_PATH")
     secret_token = required_env("WEBHOOK_SECRET_TOKEN")
-    parsed_url = urlparse(public_base_url)
-    if parsed_url.scheme != "https" or not parsed_url.netloc:
-        raise ConfigurationError("WEBHOOK_PUBLIC_BASE_URL must be an HTTPS URL.")
     if not path.startswith("/"):
         raise ConfigurationError("WEBHOOK_PATH must start with '/'.")
     if not 1 <= len(secret_token) <= 256:
@@ -159,6 +179,51 @@ def webhook_configuration() -> tuple[str, str, str, int, str]:
         port,
         os.getenv("WEBHOOK_LISTEN", DEFAULT_WEBHOOK_LISTEN),
     )
+
+
+def mini_app_configuration() -> tuple[str, str]:
+    """Build the Mini App URL from the shared origin and its gateway route."""
+    alias = required_env("WEBHOOK_DOCKER_ALIAS")
+    if DOCKER_ALIAS_PATTERN.fullmatch(alias) is None:
+        raise ConfigurationError("WEBHOOK_DOCKER_ALIAS is invalid.")
+    expected_path = f"/apps/{alias}/"
+    app_path = os.getenv("MINI_APP_PATH", expected_path).strip()
+    if app_path != expected_path:
+        raise ConfigurationError(
+            "MINI_APP_PATH must be /apps/<WEBHOOK_DOCKER_ALIAS>/."
+        )
+    return common_public_base_url() + app_path, app_path
+
+
+async def set_personal_menu_button(bot, user_id: int, app_url: str) -> None:
+    """Configure one user's read-only transcript entry point, best effort."""
+    try:
+        await bot.set_chat_menu_button(
+            chat_id=user_id,
+            menu_button=MenuButtonWebApp("Memos", WebAppInfo(app_url)),
+        )
+    except Exception as error:
+        LOGGER.warning(
+            "Could not configure Mini App menu for user %d (%s).",
+            user_id,
+            error.__class__.__name__,
+        )
+
+
+async def ensure_menu_on_first_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Retry the menu setup when an allowed user first contacts the bot."""
+    user = update.effective_user
+    message = update.effective_message
+    app_url = context.application.bot_data.get("mini_app_url")
+    if user is None or message is None or message.chat_id != user.id or not app_url:
+        return
+    attempted = context.application.bot_data.setdefault("menu_attempted_users", set())
+    if user.id in attempted:
+        return
+    attempted.add(user.id)
+    await set_personal_menu_button(context.bot, user.id, app_url)
 
 
 async def send_rich_transcript_reply(
@@ -706,6 +771,8 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if message is None or user is None or user.id not in allowed_ids:
         return
 
+    await ensure_menu_on_first_message(update, context)
+
     attachment = message.voice or message.audio or message.document
     if attachment is None:
         return
@@ -810,6 +877,8 @@ async def handle_unsupported_message(
     if message is None or user is None or user.id not in allowed_ids:
         return
 
+    await ensure_menu_on_first_message(update, context)
+
     await message.reply_text(
         f"<i>{UNSUPPORTED_MESSAGE_TEXT}</i>",
         parse_mode=ParseMode.HTML,
@@ -828,6 +897,7 @@ def main() -> None:
     webhook_url, webhook_path, webhook_secret_token, webhook_port, webhook_listen = (
         webhook_configuration()
     )
+    mini_app_url, app_path = mini_app_configuration()
     converter = resolve_converter(os.getenv("AUDIO_CONVERTER", DEFAULT_CONVERTER))
     smart_scheduling = boolean_env("SMART_TRANSCRIPTION_SCHEDULING")
     if not shutil.which(converter):
@@ -852,7 +922,9 @@ def main() -> None:
     transcript_store.initialize()
 
     audio_messages = filters.VOICE | filters.AUDIO | filters.Document.Category("audio/")
-    app = ApplicationBuilder().token(token).concurrent_updates(True).build()
+    app = (
+        ApplicationBuilder().token(token).updater(None).concurrent_updates(True).build()
+    )
     app.bot_data.update(
         allowed_user_ids=user_ids,
         stage_locks=StageLocks(),
@@ -868,6 +940,8 @@ def main() -> None:
         transcription_scheduler=scheduler,
         transcript_store=transcript_store,
         data_directory=DATA_DIRECTORY,
+        mini_app_url=mini_app_url,
+        menu_attempted_users=set(),
     )
     app.add_handler(MessageHandler(filters.User(user_id=user_ids) & audio_messages, handle_audio))
     app.add_handler(
@@ -876,20 +950,35 @@ def main() -> None:
             handle_unsupported_message,
         )
     )
+    async def configure_all_menu_buttons(bot, user_ids: set[int]) -> None:
+        for user_id in sorted(user_ids):
+            await set_personal_menu_button(bot, user_id, mini_app_url)
+
+    web_application = create_web_application(
+        app,
+        webhook_path=webhook_path,
+        webhook_url=webhook_url,
+        webhook_secret_token=webhook_secret_token,
+        app_path=app_path,
+        bot_token=token,
+        allowed_user_ids=user_ids,
+        transcript_store=transcript_store,
+        configure_menu_buttons=configure_all_menu_buttons,
+    )
     LOGGER.info(
-        "Starting webhook listener on %s:%d%s for %d allowed user(s).",
+        "Starting HTTP listener on %s:%d for Telegram at %s and Mini App at %s "
+        "for %d allowed user(s).",
         webhook_listen,
         webhook_port,
         webhook_path,
+        app_path,
         len(user_ids),
     )
-    app.run_webhook(
-        listen=webhook_listen,
+    uvicorn.run(
+        web_application,
+        host=webhook_listen,
         port=webhook_port,
-        url_path=webhook_path,
-        webhook_url=webhook_url,
-        allowed_updates=Update.ALL_TYPES,
-        secret_token=webhook_secret_token,
+        access_log=True,
     )
 
 
