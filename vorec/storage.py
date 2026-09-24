@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class TranscriptStorageError(RuntimeError):
@@ -66,6 +66,25 @@ class TranscriptStore:
 
                     CREATE INDEX IF NOT EXISTS ix_transcripts_created
                         ON transcripts (created_at DESC);
+
+                    CREATE TABLE IF NOT EXISTS tags (
+                        id          INTEGER PRIMARY KEY,
+                        name        TEXT NOT NULL UNIQUE
+                                    CHECK (length(trim(name)) > 0),
+                        description TEXT NOT NULL
+                                    CHECK (length(trim(description)) > 0)
+                    );
+
+                    CREATE TABLE IF NOT EXISTS transcript_tags (
+                        transcript_id INTEGER NOT NULL
+                            REFERENCES transcripts(id) ON DELETE CASCADE,
+                        tag_id        INTEGER NOT NULL
+                            REFERENCES tags(id) ON DELETE CASCADE,
+                        PRIMARY KEY (transcript_id, tag_id)
+                    );
+
+                    CREATE INDEX IF NOT EXISTS ix_transcript_tags_tag
+                        ON transcript_tags (tag_id, transcript_id);
                     """
                 )
                 connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -131,7 +150,9 @@ class TranscriptStore:
             ) from error
 
     def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.database_path, timeout=5)
+        connection = sqlite3.connect(self.database_path, timeout=5)
+        connection.execute("PRAGMA foreign_keys = ON")
+        return connection
 
     @staticmethod
     def _validate_record(record: TranscriptRecord) -> None:
