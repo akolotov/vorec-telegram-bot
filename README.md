@@ -114,6 +114,9 @@ message ID (`YYYY-MM-DD_HH-MM-SS_<chat-id>_<message-id>`):
 - `data/voices/YYYY-MM/<recording-id>.<extension>` contains the downloaded audio.
 - `data/transcripts/YYYY-MM/<recording-id>/` contains the `primary`, `secondary`, `merged`, and
   successful `title` responses in both `.json` and `.txt` formats.
+- `data/vorec.sqlite3` indexes completed transcripts by Telegram user and creation time. It stores
+  the final text and title together with paths to the audio and artifact directory relative to
+  `data/`.
 
 The intermediate converted WAV is deleted after processing. The `data/` directory is intentionally
 excluded from Git. Incoming messages are handled concurrently, while the bot serializes each
@@ -121,6 +124,26 @@ ffmpeg, primary inference, and secondary inference stage and reports when a reco
 for one of them. Smart transcription scheduling coordinates capacity only within one bot process;
 separate deployments that share a provider must rely on that provider to enforce its own global
 capacity.
+
+### Importing an existing archive
+
+The importer supports both the current recording names and legacy names that contain only a
+timestamp. Stop the bot before writing to its database. First validate the complete archive without
+changing it:
+
+```sh
+.venv/bin/python -m vorec.import_transcripts \
+  --data-directory data \
+  --user-id <telegram-user-id> \
+  --chat-id <telegram-chat-id> \
+  --dry-run
+```
+
+Then repeat the command without `--dry-run` to create or update `data/vorec.sqlite3`. The explicit
+user and chat IDs apply to the whole archive. For current recording names, the importer verifies
+that the embedded chat ID matches. Legacy rows have no Telegram message ID. Audio files without a
+completed transcript directory are reported and ignored. When `title.txt` is absent, the importer
+uses the first 50 characters of the merged transcript as its title.
 
 ## Management
 

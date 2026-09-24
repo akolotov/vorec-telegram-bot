@@ -2,7 +2,7 @@ import asyncio
 import os
 import threading
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, Mock, call, patch
@@ -19,6 +19,7 @@ from bot import (
     PRIMARY_TRANSCRIPTION_STATUS,
     SECONDARY_TRANSCRIPTION_STATUS,
     SECOND_TRANSCRIPT_STATUS,
+    STORAGE_FAILED_TEXT,
     TITLE_STATUS,
     StageLocks,
     TranscriptionError,
@@ -50,6 +51,7 @@ from vorec.audio import (
     generate_transcript_title,
 )
 from vorec.scheduling import TranscriptionScheduler
+from vorec.storage import TranscriptStorageError
 
 
 class AllowedUserIdsTests(unittest.TestCase):
@@ -597,6 +599,7 @@ class HandleAudioTests(unittest.TestCase):
         message = Mock(
             chat_id=chat_id,
             message_id=message_id,
+            date=datetime(2026, 8, 22, 10, 0, 40, tzinfo=timezone.utc),
             message_thread_id=None,
             voice=attachment,
             audio=None,
@@ -621,6 +624,8 @@ class HandleAudioTests(unittest.TestCase):
             "title_model": "title-model",
             "converter": "ffmpeg",
             "transcription_scheduler": None,
+            "transcript_store": Mock(),
+            "data_directory": source.parent,
         }
         artifacts = source.parent / "artifacts"
         return update, context, message, bot, artifacts
@@ -670,6 +675,74 @@ class HandleAudioTests(unittest.TestCase):
         )
         bot._post.assert_awaited_once()
         self.assertEqual(bot._post.await_args.args[0], "editMessageText")
+        saved = context.application.bot_data["transcript_store"].save.call_args.args[0]
+        self.assertEqual(saved.telegram_user_id, 123)
+        self.assertEqual(saved.telegram_chat_id, 123)
+        self.assertEqual(saved.telegram_message_id, 456)
+        self.assertEqual(saved.created_at, "2026-08-22T10:00:40+00:00")
+        self.assertEqual(saved.title, "Specific title")
+        self.assertEqual(saved.text, "final text")
+        self.assertEqual(saved.source_audio_path, "audio.ogg")
+        self.assertEqual(saved.artifacts_dir, "artifacts")
+
+    @patch(
+        "bot.transcribe_recording",
+        new_callable=AsyncMock,
+        return_value=("final text", "Specific title"),
+    )
+    @patch("bot.recording_paths")
+    def test_saves_transcript_before_delivery(
+        self, recording_paths, transcribe_recording
+    ) -> None:
+        events = []
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / "audio.ogg"
+            status = Mock(chat_id=123, message_id=789)
+            status.edit_text = AsyncMock()
+            bot = Mock()
+
+            async def post(*args, **kwargs):
+                events.append("delivery")
+
+            bot._post = AsyncMock(side_effect=post)
+            update, context, _, _, artifacts = self.audio_request(
+                source, status, bot=bot
+            )
+            context.application.bot_data["transcript_store"].save.side_effect = (
+                lambda record: events.append("storage")
+            )
+            recording_paths.return_value = (source, artifacts)
+
+            asyncio.run(handle_audio(update, context))
+
+        self.assertEqual(events, ["storage", "delivery"])
+
+    @patch(
+        "bot.transcribe_recording",
+        new_callable=AsyncMock,
+        return_value=("final text", "Specific title"),
+    )
+    @patch("bot.recording_paths")
+    def test_storage_failure_prevents_delivery(
+        self, recording_paths, transcribe_recording
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / "audio.ogg"
+            status = Mock(chat_id=123, message_id=789)
+            status.edit_text = AsyncMock()
+            update, context, _, bot, artifacts = self.audio_request(source, status)
+            context.application.bot_data["transcript_store"].save.side_effect = (
+                TranscriptStorageError("database unavailable")
+            )
+            recording_paths.return_value = (source, artifacts)
+
+            asyncio.run(handle_audio(update, context))
+
+        status.edit_text.assert_awaited_once_with(
+            f"<i>{STORAGE_FAILED_TEXT}</i>",
+            parse_mode="HTML",
+        )
+        bot._post.assert_not_awaited()
 
     @patch(
         "bot.transcribe_recording",
@@ -882,13 +955,20 @@ class HandleAudioTests(unittest.TestCase):
 
 
 class ApplicationConfigurationTests(unittest.TestCase):
+    @patch("bot.TranscriptStore")
     @patch("bot.shutil.which", return_value="/usr/bin/ffmpeg")
     @patch("bot.resolve_converter", return_value="ffmpeg")
     @patch("bot.load_dotenv")
     @patch("bot.OpenAI")
     @patch("bot.ApplicationBuilder")
     def test_enables_concurrent_updates(
-        self, application_builder, openai, load_dotenv, resolve_converter, which
+        self,
+        application_builder,
+        openai,
+        load_dotenv,
+        resolve_converter,
+        which,
+        transcript_store,
     ) -> None:
         application = Mock()
         builder = application_builder.return_value
@@ -937,15 +1017,27 @@ class ApplicationConfigurationTests(unittest.TestCase):
             application.bot_data.update.call_args.kwargs["title_model"],
             DEFAULT_TITLE_MODEL,
         )
+        transcript_store.return_value.initialize.assert_called_once_with()
+        self.assertIs(
+            application.bot_data.update.call_args.kwargs["transcript_store"],
+            transcript_store.return_value,
+        )
         application.run_webhook.assert_called_once()
 
+    @patch("bot.TranscriptStore")
     @patch("bot.shutil.which", return_value="/usr/bin/ffmpeg")
     @patch("bot.resolve_converter", return_value="ffmpeg")
     @patch("bot.load_dotenv")
     @patch("bot.OpenAI")
     @patch("bot.ApplicationBuilder")
     def test_builds_smart_scheduler_when_enabled(
-        self, application_builder, openai, load_dotenv, resolve_converter, which
+        self,
+        application_builder,
+        openai,
+        load_dotenv,
+        resolve_converter,
+        which,
+        transcript_store,
     ) -> None:
         application = Mock()
         builder = application_builder.return_value
