@@ -209,6 +209,46 @@ class TranscriptStoreTests(unittest.TestCase):
                     1,
                 )
 
+    def test_save_with_tags_replaces_links_and_keeps_title_atomic(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = TranscriptStore(Path(directory) / "vorec.sqlite3")
+            store.initialize()
+            store.create_tag(101, "work", "Work notes")
+            store.create_tag(101, "travel", "Trips")
+            store.create_tag(202, "work", "Another user's work notes")
+            self.assertEqual(
+                [(tag.name, tag.description) for tag in store.list_tags_for_user(101)],
+                [("travel", "Trips"), ("work", "Work notes")],
+            )
+            with self.assertRaisesRegex(TranscriptStorageError, "no longer exists"):
+                store.save_with_tags(
+                    transcript_record(
+                        telegram_user_id=202,
+                        telegram_chat_id=404,
+                        telegram_message_id=505,
+                        source_audio_path="voices/other.ogg",
+                        artifacts_dir="transcripts/other",
+                    ),
+                    ("travel",),
+                )
+            self.assertEqual(store.list_for_user(202), [])
+
+            store.save_with_tags(transcript_record(), ("work", "travel"))
+            detail = store.get_for_user(store.list_for_user(101)[0].id, 101)
+            self.assertEqual([tag.name for tag in detail.tags], ["travel", "work"])
+
+            updated = transcript_record(title="Updated title")
+            with self.assertRaisesRegex(TranscriptStorageError, "no longer exists"):
+                store.save_with_tags(updated, ("missing",))
+            detail = store.get_for_user(detail.id, 101)
+            self.assertEqual(detail.title, "Specific title")
+            self.assertEqual([tag.name for tag in detail.tags], ["travel", "work"])
+
+            store.save_with_tags(updated, ())
+            detail = store.get_for_user(detail.id, 101)
+            self.assertEqual(detail.title, "Updated title")
+            self.assertEqual(detail.tags, ())
+
     def test_migrates_empty_version_two_tags_and_refuses_nonempty_tags(self) -> None:
         with TemporaryDirectory() as directory:
             database = Path(directory) / "vorec.sqlite3"

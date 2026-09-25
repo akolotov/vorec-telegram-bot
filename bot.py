@@ -35,7 +35,7 @@ from vorec.audio import (
     transcribe_audio,
 )
 from vorec.scheduling import TranscriptionResource, TranscriptionScheduler
-from vorec.storage import TranscriptRecord, TranscriptStorageError, TranscriptStore
+from vorec.storage import TagDefinition, TranscriptRecord, TranscriptStorageError, TranscriptStore
 from vorec.miniapp_web import create_web_application
 
 
@@ -488,7 +488,8 @@ async def transcribe_recording(
     artifacts_directory: Path | None = None,
     progress: Callable[[str], Awaitable[None]] | None = None,
     scheduler: TranscriptionScheduler | None = None,
-) -> tuple[str, str]:
+    available_tags: tuple[TagDefinition, ...] = (),
+) -> tuple[str, str, tuple[str, ...]]:
     """Run both ASR engines, consolidate their results, and generate a title."""
     wav_path = source.with_name(f"{source.stem}.prepared.wav")
     pipeline_started = time.monotonic()
@@ -657,11 +658,12 @@ async def transcribe_recording(
             raise TranscriptionError("The transcription service returned an empty transcript.")
 
         title = transcript[:TRANSCRIPT_TITLE_LENGTH]
+        selected_tags: tuple[str, ...] = ()
         try:
             stage_started = time.monotonic()
             LOGGER.info("Starting transcript title through the inference provider.")
             if scheduler is None:
-                title_result, title = await run_serial_stage(
+                title_result, title, selected_tags = await run_serial_stage(
                     stage_locks.primary,
                     WAITING_FOR_TITLE_STATUS,
                     TITLE_STATUS,
@@ -669,6 +671,7 @@ async def transcribe_recording(
                     transcript,
                     primary_inference_client,
                     title_model,
+                    available_tags,
                     progress=progress,
                 )
             else:
@@ -682,11 +685,12 @@ async def transcribe_recording(
                 ):
                     if progress is not None:
                         await progress(TITLE_STATUS)
-                    title_result, title = await run_blocking_operation(
+                    title_result, title, selected_tags = await run_blocking_operation(
                         generate_transcript_title,
                         transcript,
                         primary_inference_client,
                         title_model,
+                        available_tags,
                     )
             if artifacts_directory is not None:
                 save_transcription_artifact(
@@ -696,14 +700,16 @@ async def transcribe_recording(
                 "Transcript title completed in %.1f s.",
                 time.monotonic() - stage_started,
             )
-        except Exception:
-            LOGGER.exception(
-                "Transcript title failed; using the transcript prefix instead."
+        except Exception as error:
+            LOGGER.warning(
+                "Transcript title failed (%s); using the transcript prefix instead.",
+                error.__class__.__name__,
             )
             title = transcript[:TRANSCRIPT_TITLE_LENGTH]
+            selected_tags = ()
 
         LOGGER.info("Transcription pipeline completed in %.1f s.", time.monotonic() - pipeline_started)
-        return transcript, title
+        return transcript, title, selected_tags
     finally:
         wav_path.unlink(missing_ok=True)
 
@@ -806,7 +812,11 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             if status_message is not None:
                 await edit_italic_status(status_message, text)
 
-        transcript, title = await transcribe_recording(
+        transcript_store: TranscriptStore = context.application.bot_data[
+            "transcript_store"
+        ]
+        available_tags = transcript_store.list_tags_for_user(user.id)
+        transcript, title, selected_tags = await transcribe_recording(
             source,
             context.application.bot_data["primary_inference_client"],
             context.application.bot_data["primary_transcription_model"],
@@ -819,11 +829,9 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             artifacts_directory,
             report_progress,
             scheduler=context.application.bot_data["transcription_scheduler"],
+            available_tags=available_tags,
         )
-        transcript_store: TranscriptStore = context.application.bot_data[
-            "transcript_store"
-        ]
-        transcript_store.save(
+        transcript_store.save_with_tags(
             TranscriptRecord(
                 telegram_user_id=user.id,
                 telegram_chat_id=message.chat_id,
@@ -835,7 +843,8 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 artifacts_dir=relative_data_path(
                     artifacts_directory, data_directory
                 ),
-            )
+            ),
+            selected_tags,
         )
     except Exception as error:
         LOGGER.exception("Failed to process audio from Telegram user %s", user.id)

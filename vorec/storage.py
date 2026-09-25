@@ -36,6 +36,11 @@ class TagRecord:
 
 
 @dataclass(frozen=True)
+class TagDefinition(TagRecord):
+    description: str
+
+
+@dataclass(frozen=True)
 class TranscriptSummary:
     id: int
     created_at: str
@@ -156,6 +161,42 @@ class TranscriptStore:
         """Insert or update one completed transcript atomically."""
         self.save_many((record,))
 
+    def save_with_tags(self, record: TranscriptRecord, tag_names: tuple[str, ...]) -> None:
+        """Save a transcript and replace its personal tag links in one transaction."""
+        self._validate_record(record)
+        if len(tag_names) != len(set(tag_names)):
+            raise TranscriptStorageError("Transcript tags must be unique.")
+        try:
+            with self._connect() as connection:
+                tag_ids: list[int] = []
+                for name in tag_names:
+                    row = connection.execute(
+                        "SELECT id FROM tags WHERE telegram_user_id = ? AND name = ?",
+                        (record.telegram_user_id, name),
+                    ).fetchone()
+                    if row is None:
+                        raise TranscriptStorageError("A selected personal tag no longer exists.")
+                    tag_ids.append(row[0])
+                self._save_records(connection, (record,))
+                transcript_id = connection.execute(
+                    "SELECT id FROM transcripts WHERE source_audio_path = ?",
+                    (record.source_audio_path,),
+                ).fetchone()[0]
+                connection.execute(
+                    "DELETE FROM transcript_tags WHERE transcript_id = ?", (transcript_id,)
+                )
+                connection.executemany(
+                    "INSERT INTO transcript_tags (transcript_id, tag_id, telegram_user_id) "
+                    "VALUES (?, ?, ?)",
+                    [(transcript_id, tag_id, record.telegram_user_id) for tag_id in tag_ids],
+                )
+        except TranscriptStorageError:
+            raise
+        except (OSError, sqlite3.Error) as error:
+            raise TranscriptStorageError(
+                f"Could not save transcript metadata: {error}"
+            ) from error
+
     def save_many(self, records: Iterable[TranscriptRecord]) -> None:
         """Insert or update completed transcripts in one transaction."""
         records = tuple(records)
@@ -166,45 +207,51 @@ class TranscriptStore:
 
         try:
             with self._connect() as connection:
-                connection.executemany(
-                    """
-                    INSERT INTO transcripts (
-                        telegram_user_id,
-                        telegram_chat_id,
-                        telegram_message_id,
-                        created_at,
-                        title,
-                        text,
-                        source_audio_path,
-                        artifacts_dir
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(source_audio_path) DO UPDATE SET
-                        telegram_user_id = excluded.telegram_user_id,
-                        telegram_chat_id = excluded.telegram_chat_id,
-                        telegram_message_id = excluded.telegram_message_id,
-                        created_at = excluded.created_at,
-                        title = excluded.title,
-                        text = excluded.text,
-                        artifacts_dir = excluded.artifacts_dir
-                    """,
-                    [
-                        (
-                            record.telegram_user_id,
-                            record.telegram_chat_id,
-                            record.telegram_message_id,
-                            record.created_at,
-                            record.title,
-                            record.text,
-                            record.source_audio_path,
-                            record.artifacts_dir,
-                        )
-                        for record in records
-                    ],
-                )
+                self._save_records(connection, records)
         except (OSError, sqlite3.Error) as error:
             raise TranscriptStorageError(
                 f"Could not save transcript metadata: {error}"
             ) from error
+
+    @staticmethod
+    def _save_records(
+        connection: sqlite3.Connection, records: tuple[TranscriptRecord, ...]
+    ) -> None:
+        connection.executemany(
+            """
+            INSERT INTO transcripts (
+                telegram_user_id,
+                telegram_chat_id,
+                telegram_message_id,
+                created_at,
+                title,
+                text,
+                source_audio_path,
+                artifacts_dir
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source_audio_path) DO UPDATE SET
+                telegram_user_id = excluded.telegram_user_id,
+                telegram_chat_id = excluded.telegram_chat_id,
+                telegram_message_id = excluded.telegram_message_id,
+                created_at = excluded.created_at,
+                title = excluded.title,
+                text = excluded.text,
+                artifacts_dir = excluded.artifacts_dir
+            """,
+            [
+                (
+                    record.telegram_user_id,
+                    record.telegram_chat_id,
+                    record.telegram_message_id,
+                    record.created_at,
+                    record.title,
+                    record.text,
+                    record.source_audio_path,
+                    record.artifacts_dir,
+                )
+                for record in records
+            ],
+        )
 
     def create_tag(
         self, telegram_user_id: int, name: str, description: str
@@ -226,6 +273,19 @@ class TranscriptStore:
                 return TagRecord(cursor.lastrowid, canonical_name)
         except (OSError, sqlite3.Error) as error:
             raise TranscriptStorageError("Could not create personal tag.") from error
+
+    def list_tags_for_user(self, telegram_user_id: int) -> tuple[TagDefinition, ...]:
+        """Read names and descriptions available for one user's classification."""
+        try:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    "SELECT id, name, description FROM tags "
+                    "WHERE telegram_user_id = ? ORDER BY name, id",
+                    (telegram_user_id,),
+                ).fetchall()
+        except (OSError, sqlite3.Error) as error:
+            raise TranscriptStorageError("Could not read personal tags.") from error
+        return tuple(TagDefinition(*row) for row in rows)
 
     def list_for_user(self, telegram_user_id: int) -> list[TranscriptSummary]:
         """Read a user's transcript metadata and personal tags in one query."""
