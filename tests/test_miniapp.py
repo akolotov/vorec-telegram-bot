@@ -248,7 +248,7 @@ class MiniAppWebTests(unittest.TestCase):
                 self.assertEqual(client.post("/apps/bot/api/tags", json={"name": "valid"}, headers=headers).status_code, 400)
                 self.assertEqual(client.put(f"/apps/bot/api/tags/{other_tag.id}", json={"name": "stolen", "description": "No"}, headers=headers).status_code, 404)
                 self.assertEqual(client.delete(f"/apps/bot/api/tags/{other_tag.id}", headers=headers).status_code, 404)
-                store.save_with_tags(TranscriptRecord(101, 101, 1, "2026-09-24T10:00:00+00:00", "My title", "Private text", "voices/my.ogg", "transcripts/my"), ("work",))
+                store.save_with_tags(TranscriptRecord(101, 101, 1, "2026-09-24T10:00:00+00:00", "My title", "Private text", "voices/my.ogg", "transcripts/my"), (tag_id,))
                 updated = client.put(f"/apps/bot/api/tags/{tag_id}", json={"name": "project", "description": "Project notes"}, headers=headers)
                 self.assertEqual(updated.status_code, 200)
                 self.assertEqual(updated.json()["name"], "project")

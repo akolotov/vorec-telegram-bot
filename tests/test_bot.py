@@ -813,6 +813,9 @@ class HandleAudioTests(unittest.TestCase):
             status = Mock(chat_id=123, message_id=789)
             status.edit_text = AsyncMock()
             update, context, message, bot, artifacts = self.audio_request(source, status)
+            context.application.bot_data["transcript_store"].list_tags_for_user.return_value = (
+                TagDefinition(7, "работа", "Work notes"),
+            )
             recording_paths.return_value = (source, artifacts)
 
             async def transcribe(*args, **kwargs):
@@ -858,7 +861,7 @@ class HandleAudioTests(unittest.TestCase):
         self.assertEqual(saved.source_audio_path, "audio.ogg")
         self.assertEqual(saved.artifacts_dir, "artifacts")
         context.application.bot_data["transcript_store"].save_with_tags.assert_called_once_with(
-            saved, ("работа",)
+            saved, (7,)
         )
 
     @patch(

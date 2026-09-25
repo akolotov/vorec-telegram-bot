@@ -37,7 +37,7 @@ class TranscriptStoreTests(unittest.TestCase):
             store.save(transcript_record())
             first = store.create_tag(101, " #Work ", " Work notes ")
             other = store.create_tag(202, "work", "Other user's tag")
-            store.save_with_tags(transcript_record(), ("work",))
+            store.save_with_tags(transcript_record(), (first.id,))
 
             self.assertEqual(first.name, "work")
             self.assertEqual(first.description, "Work notes")
@@ -249,8 +249,8 @@ class TranscriptStoreTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             store = TranscriptStore(Path(directory) / "vorec.sqlite3")
             store.initialize()
-            store.create_tag(101, "work", "Work notes")
-            store.create_tag(101, "travel", "Trips")
+            work = store.create_tag(101, "work", "Work notes")
+            travel = store.create_tag(101, "travel", "Trips")
             store.create_tag(202, "work", "Another user's work notes")
             self.assertEqual(
                 [(tag.name, tag.description) for tag in store.list_tags_for_user(101)],
@@ -264,19 +264,19 @@ class TranscriptStoreTests(unittest.TestCase):
                     source_audio_path="voices/other.ogg",
                     artifacts_dir="transcripts/other",
                 ),
-                ("travel",),
+                (travel.id,),
             )
             other = store.list_for_user(202)
             self.assertEqual(len(other), 1)
             self.assertEqual(other[0].tags, ())
 
-            store.save_with_tags(transcript_record(), ("work", "travel"))
+            store.save_with_tags(transcript_record(), (work.id, travel.id))
             detail = store.get_for_user(store.list_for_user(101)[0].id, 101)
             self.assertEqual([tag.name for tag in detail.tags], ["travel", "work"])
 
             updated = transcript_record(title="Updated title")
             with self.assertRaisesRegex(TranscriptStorageError, "unique"):
-                store.save_with_tags(updated, ("work", "work"))
+                store.save_with_tags(updated, (work.id, work.id))
             detail = store.get_for_user(detail.id, 101)
             self.assertEqual(detail.title, "Specific title")
             self.assertEqual([tag.name for tag in detail.tags], ["travel", "work"])
@@ -294,18 +294,29 @@ class TranscriptStoreTests(unittest.TestCase):
             store.create_tag(101, "travel", "Trips")
             available_tags = store.list_tags_for_user(101)
 
-            with store._connect() as connection:
-                connection.execute(
-                    "DELETE FROM tags WHERE telegram_user_id = ? AND name = ?",
-                    (101, "travel"),
-                )
+            deleted_id = next(tag.id for tag in available_tags if tag.name == "travel")
+            store.delete_tag(101, deleted_id)
+            store.create_tag(101, "travel", "New trips")
 
             store.save_with_tags(
-                transcript_record(), tuple(tag.name for tag in available_tags)
+                transcript_record(), tuple(tag.id for tag in available_tags)
             )
             records = store.list_for_user(101)
             self.assertEqual(len(records), 1)
             self.assertEqual([tag.name for tag in records[0].tags], ["work"])
+
+    def test_save_with_tags_keeps_tag_renamed_during_transcription(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = TranscriptStore(Path(directory) / "vorec.sqlite3")
+            store.initialize()
+            selected = store.create_tag(101, "work", "Work notes")
+
+            store.update_tag(101, selected.id, "projects", "Project notes")
+            store.save_with_tags(transcript_record(), (selected.id,))
+
+            self.assertEqual(
+                [tag.name for tag in store.list_for_user(101)[0].tags], ["projects"]
+            )
 
     def test_migrates_empty_version_two_tags_and_refuses_nonempty_tags(self) -> None:
         with TemporaryDirectory() as directory:
@@ -333,7 +344,7 @@ class TranscriptStoreTests(unittest.TestCase):
                 connection.execute("DELETE FROM tags")
             store.initialize()
             with sqlite3.connect(database) as connection:
-                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 3)
+                self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
                 self.assertEqual(
                     connection.execute("SELECT title FROM transcripts").fetchone()[0],
                     "Specific title",
@@ -342,6 +353,30 @@ class TranscriptStoreTests(unittest.TestCase):
                     connection.execute("PRAGMA table_info(tags)").fetchall()[1][1],
                     "telegram_user_id",
                 )
+
+    def test_migrates_version_three_tags_without_reusing_ids(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = TranscriptStore(Path(directory) / "vorec.sqlite3")
+            store.initialize()
+            original = store.create_tag(101, "work", "Work notes")
+            store.save_with_tags(transcript_record(), (original.id,))
+            with store._connect() as connection:
+                connection.execute("DROP TRIGGER reserve_tag_id")
+                connection.execute("DROP TABLE tag_id_allocations")
+                connection.execute("PRAGMA user_version = 3")
+
+            store.initialize()
+            self.assertEqual(store.list_for_user(101)[0].tags[0].id, original.id)
+            store.delete_tag(101, original.id)
+            replacement = store.create_tag(101, "work", "New work notes")
+            self.assertGreater(replacement.id, original.id)
+            self.assertEqual(store.list_for_user(101)[0].tags, ())
+            with store._connect() as connection:
+                external_id = connection.execute(
+                    "INSERT INTO tags (telegram_user_id, name, description) "
+                    "VALUES (101, 'travel', 'Trip notes')"
+                ).lastrowid
+            self.assertGreater(store.create_tag(101, "home", "Home notes").id, external_id)
 
     def test_reads_only_own_transcripts_and_tags(self) -> None:
         with TemporaryDirectory() as directory:

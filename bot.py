@@ -831,6 +831,10 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             scheduler=context.application.bot_data["transcription_scheduler"],
             available_tags=available_tags,
         )
+        tag_ids_by_name = {tag.name: tag.id for tag in available_tags}
+        selected_tag_ids = tuple(
+            tag_ids_by_name[name] for name in selected_tags if name in tag_ids_by_name
+        )
         transcript_store.save_with_tags(
             TranscriptRecord(
                 telegram_user_id=user.id,
@@ -844,7 +848,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     artifacts_directory, data_directory
                 ),
             ),
-            selected_tags,
+            selected_tag_ids,
         )
     except Exception as error:
         LOGGER.exception("Failed to process audio from Telegram user %s", user.id)
