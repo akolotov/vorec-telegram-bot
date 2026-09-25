@@ -5,6 +5,8 @@ from tempfile import TemporaryDirectory
 
 from vorec.storage import (
     SCHEMA_VERSION,
+    TagConflictError,
+    TagValidationError,
     TranscriptRecord,
     TranscriptStorageError,
     TranscriptStore,
@@ -28,6 +30,40 @@ def transcript_record(**overrides) -> TranscriptRecord:
 
 
 class TranscriptStoreTests(unittest.TestCase):
+    def test_tag_management_preserves_transcripts_and_enforces_ownership(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = TranscriptStore(Path(directory) / "vorec.sqlite3")
+            store.initialize()
+            store.save(transcript_record())
+            first = store.create_tag(101, " #Work ", " Work notes ")
+            other = store.create_tag(202, "work", "Other user's tag")
+            store.save_with_tags(transcript_record(), ("work",))
+
+            self.assertEqual(first.name, "work")
+            self.assertEqual(first.description, "Work notes")
+            self.assertEqual(store.list_tags_for_user(101), (first,))
+            self.assertIsNone(store.update_tag(101, other.id, "changed", "Changed"))
+            self.assertFalse(store.delete_tag(101, other.id))
+            self.assertEqual(store.list_tags_for_user(202), (other,))
+            with self.assertRaises(TagConflictError):
+                store.create_tag(101, "WORK", "Duplicate")
+            with self.assertRaises(TagValidationError):
+                store.create_tag(101, " ", "Description")
+            with self.assertRaises(TagValidationError):
+                store.update_tag(101, first.id, "work", " ")
+            duplicate = store.create_tag(101, "travel", "Travel notes")
+            with self.assertRaises(TagConflictError):
+                store.update_tag(101, first.id, "TRAVEL", "Other description")
+
+            updated = store.update_tag(101, first.id, " #Projects ", " Projects and plans ")
+            self.assertEqual((updated.name, updated.description), ("projects", "Projects and plans"))
+            self.assertEqual(store.list_for_user(101)[0].tags[0].name, "projects")
+            self.assertEqual(store.list_tags_for_user(101)[1], duplicate)
+            self.assertTrue(store.delete_tag(101, first.id))
+            self.assertEqual(store.list_for_user(101)[0].tags, ())
+            self.assertIsNotNone(store.get_for_user(store.list_for_user(101)[0].id, 101))
+            self.assertEqual(store.list_tags_for_user(202), (other,))
+
     def test_initializes_versioned_schema_and_indexes_idempotently(self) -> None:
         with TemporaryDirectory() as directory:
             database = Path(directory) / "data" / "vorec.sqlite3"

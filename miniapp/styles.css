@@ -26,6 +26,7 @@ button { font: inherit; }
            calc(18px + var(--tg-content-safe-area-inset-left, 0px));
 }
 .header { margin-bottom: 22px; }
+.header-title { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
 h1 { margin: 0 0 20px; font-size: 29px; line-height: 1.2; letter-spacing: -.02em; }
 .tabs {
   display: flex;
@@ -58,4 +59,25 @@ h1 { margin: 0 0 20px; font-size: 29px; line-height: 1.2; letter-spacing: -.02em
 .detail-date { margin: 0 0 8px; color: var(--muted); font-size: 13px; }
 #detail-title { margin-bottom: 10px; overflow-wrap: anywhere; }
 .detail-text { margin-top: 26px; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.65; }
+.settings-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.settings-status { color: var(--muted); }
+.settings-status:not(:empty) { margin-bottom: 12px; }
+.tag-card { margin: 0 0 10px; padding: 14px 16px; border-radius: 13px; background: var(--surface); }
+.tag-card-name { font-weight: 600; color: var(--accent); overflow-wrap: anywhere; }
+.tag-card-body { display: flex; align-items: flex-start; gap: 8px; }
+.tag-card-description { flex: 1; min-width: 0; margin: 5px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.tag-actions { display: flex; flex: none; gap: 2px; }
+.icon-button { display: inline-flex; align-items: center; justify-content: center; flex: none; width: 40px; height: 40px; padding: 0; border: 0; border-radius: 10px; background: transparent; color: var(--muted); cursor: pointer; }
+.icon-button:hover, .icon-button:focus-visible { background: var(--background); color: var(--text); }
+.icon-button svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.tag-form { display: grid; gap: 8px; }
+.tag-form h2 { margin: 0 0 4px; font-size: 18px; }
+.tag-form label { font-weight: 600; font-size: 14px; }
+.tag-form input, .tag-form textarea { width: 100%; padding: 10px; border: 1px solid var(--border); border-radius: 9px; background: var(--background); color: var(--text); font: inherit; }
+.form-actions { display: flex; gap: 10px; margin-top: 6px; }
+.form-actions button { padding: 8px 13px; border-radius: 9px; cursor: pointer; }
+.secondary-button { border: 1px solid var(--border); background: transparent; color: var(--text); }
+.tag-form-error { color: #b42318; font-size: 14px; }
+.primary-button { border: 0; background: var(--accent); color: #fff; }
+button:disabled { opacity: .55; cursor: wait; }
 [hidden] { display: none !important; }

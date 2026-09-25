@@ -15,6 +15,14 @@ class TranscriptStorageError(RuntimeError):
     """Raised when transcript metadata cannot be persisted safely."""
 
 
+class TagValidationError(TranscriptStorageError):
+    """A tag name or description is invalid."""
+
+
+class TagConflictError(TranscriptStorageError):
+    """A user already has a tag with this name."""
+
+
 @dataclass(frozen=True)
 class TranscriptRecord:
     """One completed transcript and its persistent artifact locations."""
@@ -255,24 +263,63 @@ class TranscriptStore:
 
     def create_tag(
         self, telegram_user_id: int, name: str, description: str
-    ) -> TagRecord:
-        """Persist one canonical personal tag for a future tagging producer."""
-        try:
-            canonical_name = normalize_tag_name(name)
-        except ValueError as error:
-            raise TranscriptStorageError(str(error)) from error
-        description = description.strip()
-        if not description:
-            raise TranscriptStorageError("A tag description must not be empty.")
+    ) -> TagDefinition:
+        """Persist one canonical personal tag."""
+        canonical_name, description = self._tag_values(name, description)
         try:
             with self._connect() as connection:
                 cursor = connection.execute(
                     "INSERT INTO tags (telegram_user_id, name, description) VALUES (?, ?, ?)",
                     (telegram_user_id, canonical_name, description),
                 )
-                return TagRecord(cursor.lastrowid, canonical_name)
+                return TagDefinition(cursor.lastrowid, canonical_name, description)
+        except sqlite3.IntegrityError as error:
+            raise TagConflictError("A tag with this name already exists.") from error
         except (OSError, sqlite3.Error) as error:
             raise TranscriptStorageError("Could not create personal tag.") from error
+
+    @staticmethod
+    def _tag_values(name: str, description: str) -> tuple[str, str]:
+        try:
+            canonical_name = normalize_tag_name(name)
+        except (ValueError, AttributeError) as error:
+            raise TagValidationError("A tag name must not be empty.") from error
+        description = description.strip()
+        if not description:
+            raise TagValidationError("A tag description must not be empty.")
+        return canonical_name, description
+
+    def update_tag(
+        self, telegram_user_id: int, tag_id: int, name: str, description: str
+    ) -> TagDefinition | None:
+        """Change a tag only when it belongs to this user."""
+        canonical_name, description = self._tag_values(name, description)
+        try:
+            with self._connect() as connection:
+                cursor = connection.execute(
+                    "UPDATE tags SET name = ?, description = ? "
+                    "WHERE id = ? AND telegram_user_id = ?",
+                    (canonical_name, description, tag_id, telegram_user_id),
+                )
+                if not cursor.rowcount:
+                    return None
+                return TagDefinition(tag_id, canonical_name, description)
+        except sqlite3.IntegrityError as error:
+            raise TagConflictError("A tag with this name already exists.") from error
+        except (OSError, sqlite3.Error) as error:
+            raise TranscriptStorageError("Could not update personal tag.") from error
+
+    def delete_tag(self, telegram_user_id: int, tag_id: int) -> bool:
+        """Delete an owned tag and let foreign keys remove its transcript links."""
+        try:
+            with self._connect() as connection:
+                cursor = connection.execute(
+                    "DELETE FROM tags WHERE id = ? AND telegram_user_id = ?",
+                    (tag_id, telegram_user_id),
+                )
+                return bool(cursor.rowcount)
+        except (OSError, sqlite3.Error) as error:
+            raise TranscriptStorageError("Could not delete personal tag.") from error
 
     def list_tags_for_user(self, telegram_user_id: int) -> tuple[TagDefinition, ...]:
         """Read names and descriptions available for one user's classification."""
