@@ -8,11 +8,19 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class TranscriptStorageError(RuntimeError):
     """Raised when transcript metadata cannot be persisted safely."""
+
+
+class TagValidationError(TranscriptStorageError):
+    """A tag name or description is invalid."""
+
+
+class TagConflictError(TranscriptStorageError):
+    """A user already has a tag with this name."""
 
 
 @dataclass(frozen=True)
@@ -106,7 +114,7 @@ class TranscriptStore:
                     "ON transcripts (id, telegram_user_id)"
                 )
 
-                if version < SCHEMA_VERSION:
+                if version < 3:
                     tables = {
                         row[0]
                         for row in connection.execute(
@@ -132,6 +140,20 @@ class TranscriptStore:
                         UNIQUE (telegram_user_id, name),
                         UNIQUE (id, telegram_user_id)
                     )"""
+                )
+                # Keep deleted IDs reserved for classifications already in progress.
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS tag_id_allocations "
+                    "(id INTEGER PRIMARY KEY AUTOINCREMENT)"
+                )
+                connection.execute(
+                    "INSERT OR IGNORE INTO tag_id_allocations (id) SELECT id FROM tags"
+                )
+                connection.execute(
+                    """CREATE TRIGGER IF NOT EXISTS reserve_tag_id AFTER INSERT ON tags
+                    BEGIN
+                        INSERT OR IGNORE INTO tag_id_allocations (id) VALUES (NEW.id);
+                    END"""
                 )
                 connection.execute(
                     """CREATE TABLE IF NOT EXISTS transcript_tags (
@@ -161,22 +183,22 @@ class TranscriptStore:
         """Insert or update one completed transcript atomically."""
         self.save_many((record,))
 
-    def save_with_tags(self, record: TranscriptRecord, tag_names: tuple[str, ...]) -> None:
+    def save_with_tags(self, record: TranscriptRecord, tag_ids: tuple[int, ...]) -> None:
         """Save a transcript and replace its personal tag links in one transaction."""
         self._validate_record(record)
-        if len(tag_names) != len(set(tag_names)):
+        if len(tag_ids) != len(set(tag_ids)):
             raise TranscriptStorageError("Transcript tags must be unique.")
         try:
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
-                tag_ids: list[int] = []
-                for name in tag_names:
+                owned_tag_ids: list[int] = []
+                for tag_id in tag_ids:
                     row = connection.execute(
-                        "SELECT id FROM tags WHERE telegram_user_id = ? AND name = ?",
-                        (record.telegram_user_id, name),
+                        "SELECT id FROM tags WHERE telegram_user_id = ? AND id = ?",
+                        (record.telegram_user_id, tag_id),
                     ).fetchone()
                     if row is not None:
-                        tag_ids.append(row[0])
+                        owned_tag_ids.append(row[0])
                 self._save_records(connection, (record,))
                 transcript_id = connection.execute(
                     "SELECT id FROM transcripts WHERE source_audio_path = ?",
@@ -188,7 +210,7 @@ class TranscriptStore:
                 connection.executemany(
                     "INSERT INTO transcript_tags (transcript_id, tag_id, telegram_user_id) "
                     "VALUES (?, ?, ?)",
-                    [(transcript_id, tag_id, record.telegram_user_id) for tag_id in tag_ids],
+                    [(transcript_id, tag_id, record.telegram_user_id) for tag_id in owned_tag_ids],
                 )
         except TranscriptStorageError:
             raise
@@ -255,24 +277,67 @@ class TranscriptStore:
 
     def create_tag(
         self, telegram_user_id: int, name: str, description: str
-    ) -> TagRecord:
-        """Persist one canonical personal tag for a future tagging producer."""
+    ) -> TagDefinition:
+        """Persist one canonical personal tag."""
+        canonical_name, description = self._tag_values(name, description)
+        try:
+            with self._connect() as connection:
+                tag_id = connection.execute(
+                    "INSERT INTO tag_id_allocations DEFAULT VALUES"
+                ).lastrowid
+                connection.execute(
+                    "INSERT INTO tags (id, telegram_user_id, name, description) "
+                    "VALUES (?, ?, ?, ?)",
+                    (tag_id, telegram_user_id, canonical_name, description),
+                )
+                return TagDefinition(tag_id, canonical_name, description)
+        except sqlite3.IntegrityError as error:
+            raise TagConflictError("A tag with this name already exists.") from error
+        except (OSError, sqlite3.Error) as error:
+            raise TranscriptStorageError("Could not create personal tag.") from error
+
+    @staticmethod
+    def _tag_values(name: str, description: str) -> tuple[str, str]:
         try:
             canonical_name = normalize_tag_name(name)
-        except ValueError as error:
-            raise TranscriptStorageError(str(error)) from error
+        except (ValueError, AttributeError) as error:
+            raise TagValidationError("A tag name must not be empty.") from error
         description = description.strip()
         if not description:
-            raise TranscriptStorageError("A tag description must not be empty.")
+            raise TagValidationError("A tag description must not be empty.")
+        return canonical_name, description
+
+    def update_tag(
+        self, telegram_user_id: int, tag_id: int, name: str, description: str
+    ) -> TagDefinition | None:
+        """Change a tag only when it belongs to this user."""
+        canonical_name, description = self._tag_values(name, description)
         try:
             with self._connect() as connection:
                 cursor = connection.execute(
-                    "INSERT INTO tags (telegram_user_id, name, description) VALUES (?, ?, ?)",
-                    (telegram_user_id, canonical_name, description),
+                    "UPDATE tags SET name = ?, description = ? "
+                    "WHERE id = ? AND telegram_user_id = ?",
+                    (canonical_name, description, tag_id, telegram_user_id),
                 )
-                return TagRecord(cursor.lastrowid, canonical_name)
+                if not cursor.rowcount:
+                    return None
+                return TagDefinition(tag_id, canonical_name, description)
+        except sqlite3.IntegrityError as error:
+            raise TagConflictError("A tag with this name already exists.") from error
         except (OSError, sqlite3.Error) as error:
-            raise TranscriptStorageError("Could not create personal tag.") from error
+            raise TranscriptStorageError("Could not update personal tag.") from error
+
+    def delete_tag(self, telegram_user_id: int, tag_id: int) -> bool:
+        """Delete an owned tag and let foreign keys remove its transcript links."""
+        try:
+            with self._connect() as connection:
+                cursor = connection.execute(
+                    "DELETE FROM tags WHERE id = ? AND telegram_user_id = ?",
+                    (tag_id, telegram_user_id),
+                )
+                return bool(cursor.rowcount)
+        except (OSError, sqlite3.Error) as error:
+            raise TranscriptStorageError("Could not delete personal tag.") from error
 
     def list_tags_for_user(self, telegram_user_id: int) -> tuple[TagDefinition, ...]:
         """Read names and descriptions available for one user's classification."""

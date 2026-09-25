@@ -194,6 +194,7 @@ class MiniAppWebTests(unittest.TestCase):
                 TranscriptRecord(202, 202, 2, "2026-09-24T11:00:00+00:00", "Other title",
                                  "Other text", "voices/other.ogg", "transcripts/other")
             )
+            other_tag = store.create_tag(202, "private", "Another user's tag")
             with sqlite3.connect(store.database_path) as connection:
                 own_id = connection.execute("SELECT id FROM transcripts WHERE telegram_user_id=101").fetchone()[0]
                 other_id = connection.execute("SELECT id FROM transcripts WHERE telegram_user_id=202").fetchone()[0]
@@ -233,6 +234,34 @@ class MiniAppWebTests(unittest.TestCase):
                 detail = client.get(f"/apps/bot/api/transcripts/{own_id}", headers=headers)
                 self.assertEqual(detail.json()["text"], "Private text")
                 self.assertEqual(client.get(f"/apps/bot/api/transcripts/{other_id}", headers=headers).status_code, 404)
+                self.assertEqual(client.get("/apps/bot/api/tags").status_code, 401)
+                self.assertEqual(client.post("/apps/bot/api/tags", json={"name": "work", "description": "Work"}).status_code, 401)
+                self.assertEqual(client.get("/apps/bot/api/tags", headers=headers).json(), {"tags": []})
+                created = client.post("/apps/bot/api/tags", json={"name": " #Work ", "description": " Work notes "}, headers=headers)
+                self.assertEqual(created.status_code, 201)
+                tag_id = created.json()["id"]
+                self.assertEqual(created.json()["name"], "work")
+                self.assertEqual(created.json()["description"], "Work notes")
+                self.assertEqual(client.get("/apps/bot/api/tags", headers=headers).json()["tags"], [created.json()])
+                self.assertEqual(client.post("/apps/bot/api/tags", json={"name": "WORK", "description": "Duplicate"}, headers=headers).status_code, 409)
+                self.assertEqual(client.post("/apps/bot/api/tags", json={"name": " ", "description": "Invalid"}, headers=headers).status_code, 400)
+                self.assertEqual(client.post("/apps/bot/api/tags", json={"name": "valid"}, headers=headers).status_code, 400)
+                self.assertEqual(client.put(f"/apps/bot/api/tags/{other_tag.id}", json={"name": "stolen", "description": "No"}, headers=headers).status_code, 404)
+                self.assertEqual(client.delete(f"/apps/bot/api/tags/{other_tag.id}", headers=headers).status_code, 404)
+                store.save_with_tags(TranscriptRecord(101, 101, 1, "2026-09-24T10:00:00+00:00", "My title", "Private text", "voices/my.ogg", "transcripts/my"), (tag_id,))
+                updated = client.put(f"/apps/bot/api/tags/{tag_id}", json={"name": "project", "description": "Project notes"}, headers=headers)
+                self.assertEqual(updated.status_code, 200)
+                self.assertEqual(updated.json()["name"], "project")
+                self.assertEqual(updated.json()["description"], "Project notes")
+                date_groups = client.get("/apps/bot/api/groups?view=date&timezone=UTC", headers=headers).json()["groups"]
+                self.assertEqual(date_groups[0]["items"][0]["tags"], ["project"])
+                tag_groups = client.get("/apps/bot/api/groups?view=tags&timezone=UTC", headers=headers).json()["groups"]
+                self.assertEqual(tag_groups[0]["tag"], "project")
+                self.assertEqual(client.delete(f"/apps/bot/api/tags/{tag_id}", headers=headers).status_code, 204)
+                self.assertEqual(client.get(f"/apps/bot/api/transcripts/{own_id}", headers=headers).status_code, 200)
+                self.assertEqual(client.get("/apps/bot/api/groups?view=date&timezone=UTC", headers=headers).json()["groups"][0]["items"][0]["tags"], [])
+                self.assertEqual(client.get("/apps/bot/api/tags", headers=headers).json(), {"tags": []})
+                self.assertEqual(store.list_tags_for_user(202), (other_tag,))
                 self.assertEqual(client.post("/hooks/bot/telegram/webhook", json={"update_id": 1}).status_code, 403)
                 with patch("vorec.miniapp_web.Update.de_json", return_value=object()):
                     self.assertEqual(client.post("/hooks/bot/telegram/webhook", json={"update_id": 1},

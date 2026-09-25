@@ -13,7 +13,15 @@
   <main class="page">
     <section id="list-screen">
       <header class="header">
-        <h1>Memos</h1>
+        <div class="header-title">
+          <h1>Memos</h1>
+          <button id="settings-button" class="icon-button" type="button" aria-label="Manage categories" title="Manage categories">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M10 2h4l.5 2.4 1.5.9 2.3-.8 2 3.5-1.8 1.6v1.8l1.8 1.6-2 3.5-2.3-.8-1.5.9L14 22h-4l-.5-2.4-1.5-.9-2.3.8-2-3.5L5 14.4v-1.8L3.2 11l2-3.5 2.3.8 1.5-.9L10 2Z"/>
+              <circle cx="12" cy="12" r="3"/>
+            </svg>
+          </button>
+        </div>
         <div class="tabs" role="tablist" aria-label="View">
           <button id="date-tab" class="tab active" type="button" role="tab" aria-selected="true">By Date</button>
           <button id="tags-tab" class="tab" type="button" role="tab" aria-selected="false">By Categories</button>
@@ -21,6 +29,17 @@
       </header>
       <div id="list-status" class="status" role="status"></div>
       <div id="groups"></div>
+    </section>
+    <section id="settings-screen" hidden>
+      <button id="settings-back-button" class="back-button" type="button">← Back</button>
+      <div class="settings-heading">
+        <h1>Categories</h1>
+        <button id="add-tag-button" class="icon-button" type="button" aria-label="Add category" title="Add category">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+        </button>
+      </div>
+      <div id="settings-status" class="settings-status" role="status"></div>
+      <div id="tag-list"></div>
     </section>
     <section id="detail-screen" hidden>
       <button id="back-button" class="back-button" type="button">← Back</button>
