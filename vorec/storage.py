@@ -168,15 +168,15 @@ class TranscriptStore:
             raise TranscriptStorageError("Transcript tags must be unique.")
         try:
             with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
                 tag_ids: list[int] = []
                 for name in tag_names:
                     row = connection.execute(
                         "SELECT id FROM tags WHERE telegram_user_id = ? AND name = ?",
                         (record.telegram_user_id, name),
                     ).fetchone()
-                    if row is None:
-                        raise TranscriptStorageError("A selected personal tag no longer exists.")
-                    tag_ids.append(row[0])
+                    if row is not None:
+                        tag_ids.append(row[0])
                 self._save_records(connection, (record,))
                 transcript_id = connection.execute(
                     "SELECT id FROM transcripts WHERE source_audio_path = ?",

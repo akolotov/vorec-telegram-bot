@@ -9,7 +9,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from openai import OpenAI
+from openai import LengthFinishReasonError, OpenAI
 from pydantic import BaseModel, ConfigDict, Field, create_model, model_validator
 
 from vorec.storage import TagDefinition
@@ -202,7 +202,7 @@ def generate_transcript_title(
                 exclude={"choices": {"__all__": {"message": {"parsed"}}}},
             )
             return raw_response, parsed.title.strip(), chosen
-        except Exception as error:
+        except (ValueError, LengthFinishReasonError) as error:
             LOGGER.warning(
                 "Title and tag generation attempt %d/%d failed (%s).",
                 attempt, TITLE_ATTEMPTS, error.__class__.__name__,

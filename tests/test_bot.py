@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, Mock, call, patch
 
 import httpx
+from openai import BadRequestError, LengthFinishReasonError
 from bot import (
     ConfigurationError,
     DEFAULT_TITLE_MODEL,
@@ -406,6 +407,33 @@ class TranscriptTitleTests(unittest.TestCase):
             ({"id": "title-response"}, "Valid title", ()),
         )
         self.assertEqual(title_client.chat.completions.parse.call_count, 2)
+
+    def test_does_not_retry_permanent_provider_error(self) -> None:
+        response = httpx.Response(
+            400,
+            request=httpx.Request("POST", "https://example.invalid/v1/chat/completions"),
+        )
+        error = BadRequestError("Structured output unsupported", response=response, body=None)
+        title_client = Mock()
+        title_client.chat.completions.parse.side_effect = error
+        client = Mock()
+        client.with_options.return_value = title_client
+
+        with self.assertRaises(BadRequestError):
+            generate_transcript_title("Full transcript", client, "title-model")
+        title_client.chat.completions.parse.assert_called_once()
+
+    def test_retries_truncated_response(self) -> None:
+        title_client = Mock()
+        title_client.chat.completions.parse.side_effect = LengthFinishReasonError(
+            completion=Mock()
+        )
+        client = Mock()
+        client.with_options.return_value = title_client
+
+        with self.assertRaises(LengthFinishReasonError):
+            generate_transcript_title("Full transcript", client, "title-model")
+        self.assertEqual(title_client.chat.completions.parse.call_count, 3)
 
 
 class RichMessageTests(unittest.TestCase):
