@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, Mock, call, patch
 
 import httpx
+from openai import BadRequestError, LengthFinishReasonError
 from bot import (
     ConfigurationError,
     DEFAULT_TITLE_MODEL,
@@ -52,9 +53,10 @@ from vorec.audio import (
     prepare_wav,
     resolve_converter,
     generate_transcript_title,
+    title_response_model,
 )
 from vorec.scheduling import TranscriptionScheduler
-from vorec.storage import TranscriptStorageError
+from vorec.storage import TagDefinition, TranscriptStorageError
 
 
 class AllowedUserIdsTests(unittest.TestCase):
@@ -266,29 +268,98 @@ class MiniAppConfigurationTests(unittest.TestCase):
 
 
 class TranscriptTitleTests(unittest.TestCase):
-    def test_uses_short_non_retrying_request_and_returns_clean_text(self) -> None:
-        message = Mock(content="  Перенос запуска из-за ошибки оплаты  ")
+    def test_title_request_limits(self) -> None:
+        self.assertEqual(TITLE_REQUEST_TIMEOUT, 60)
+        self.assertEqual(TITLE_MAX_TOKENS, 1024)
+
+    def test_schema_requires_a_boolean_for_each_existing_tag(self) -> None:
+        output_type = title_response_model(
+            (TagDefinition(1, "работа", "Work"), TagDefinition(2, "поездки", "Trips"))
+        )
+        schema = output_type.model_json_schema()
+        tag_schema = schema["$defs"]["TagFlags"]
+        self.assertEqual(
+            list(schema["properties"]), ["no_tags_explanation", "tags", "title"]
+        )
+        self.assertEqual(list(tag_schema["properties"]), ["работа", "поездки"])
+        self.assertEqual(tag_schema["required"], ["работа", "поездки"])
+        self.assertEqual(tag_schema["properties"]["работа"]["description"], "Work")
+        for payload in (
+            '{"no_tags_explanation":null,"tags":{"работа":true},"title":"План поездки"}',
+            '{"no_tags_explanation":null,"tags":{"работа":true,"поездки":false,"unknown":true},"title":"План поездки"}',
+            '{"no_tags_explanation":null,"tags":{"работа":"true","поездки":false},"title":"План поездки"}',
+            '{"no_tags_explanation":"No match","tags":{"работа":true,"поездки":false},"title":"План поездки"}',
+            '{"no_tags_explanation":null,"tags":{"работа":false,"поездки":false},"title":"План поездки"}',
+        ):
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                output_type.model_validate_json(payload)
+        tagged = output_type.model_validate_json(
+            '{"no_tags_explanation":null,"tags":{"работа":true,"поездки":true},"title":"План поездки"}'
+        )
+        self.assertEqual(
+            tagged.tags.model_dump(by_alias=True), {"работа": True, "поездки": True}
+        )
+        untagged = output_type.model_validate_json(
+            '{"no_tags_explanation":"No match","tags":{"работа":false,"поездки":false},"title":"План поездки"}'
+        )
+        self.assertEqual(
+            untagged.tags.model_dump(by_alias=True),
+            {"работа": False, "поездки": False},
+        )
+        title_without_catalog = title_response_model(())
+        self.assertEqual(
+            title_without_catalog.model_validate_json(
+                '{"no_tags_explanation":"No tags are available","tags":{},"title":"План поездки"}'
+            ).tags.model_dump(by_alias=True),
+            {},
+        )
+        with self.assertRaises(ValueError):
+            title_without_catalog.model_validate_json(
+                '{"no_tags_explanation":"No tags are available","tags":{"работа":true},"title":"План поездки"}'
+            )
+
+    def test_schema_allows_tag_name_that_matches_a_pydantic_method(self) -> None:
+        output_type = title_response_model((TagDefinition(1, "model_dump", "Example"),))
+        parsed = output_type.model_validate_json(
+            '{"no_tags_explanation":null,"tags":{"model_dump":true},"title":"Example title"}'
+        )
+        self.assertEqual(parsed.tags.model_dump(by_alias=True), {"model_dump": True})
+
+    def test_structured_response_uses_personal_tag_names(self) -> None:
+        tags = (
+            TagDefinition(1, "работа", "Рабочие задачи"),
+            TagDefinition(2, "поездки", "Билеты и маршруты"),
+        )
+        parsed = title_response_model(tags).model_validate(
+            {
+                "no_tags_explanation": None,
+                "tags": {"работа": True, "поездки": True},
+                "title": "  Презентация проекта в Казани  ",
+            }
+        )
+        message = Mock(parsed=parsed)
         response = Mock(choices=[Mock(message=message)])
         response.model_dump.return_value = {"id": "title-response"}
         title_client = Mock()
-        title_client.chat.completions.create.return_value = response
+        title_client.chat.completions.parse.return_value = response
         client = Mock()
         client.with_options.return_value = title_client
 
-        result = generate_transcript_title("Full transcript", client, "title-model")
+        result = generate_transcript_title("Full transcript", client, "title-model", tags)
 
         self.assertEqual(
             result,
             (
                 {"id": "title-response"},
-                "Перенос запуска из-за ошибки оплаты",
+                "Презентация проекта в Казани",
+                ("работа", "поездки"),
             ),
         )
         client.with_options.assert_called_once_with(
             timeout=TITLE_REQUEST_TIMEOUT,
             max_retries=0,
         )
-        request = title_client.chat.completions.create.call_args.kwargs
+        request = title_client.chat.completions.parse.call_args.kwargs
         self.assertEqual(request["model"], "title-model")
         self.assertEqual(request["temperature"], 0)
         self.assertEqual(request["max_tokens"], TITLE_MAX_TOKENS)
@@ -298,26 +369,71 @@ class TranscriptTitleTests(unittest.TestCase):
             "<TRANSCRIPT>\nFull transcript\n</TRANSCRIPT>",
             request["messages"][0]["content"],
         )
+        self.assertIn("#работа: Рабочие задачи", request["messages"][0]["content"])
+        schema = request["response_format"].model_json_schema()
+        self.assertIn("работа", str(schema))
+        self.assertIn("поездки", str(schema))
 
-    def test_rejects_empty_title_response(self) -> None:
+    def test_retries_empty_response_three_times(self) -> None:
         response = Mock(choices=[])
         title_client = Mock()
-        title_client.chat.completions.create.return_value = response
+        title_client.chat.completions.parse.return_value = response
         client = Mock()
         client.with_options.return_value = title_client
 
-        with self.assertRaisesRegex(ValueError, "empty assistant text"):
+        with self.assertRaisesRegex(ValueError, "no valid title"):
             generate_transcript_title("Full transcript", client, "title-model")
+        self.assertEqual(title_client.chat.completions.parse.call_count, 3)
 
-    def test_malformed_title_response_raises_parsing_error(self) -> None:
-        response = Mock(choices=[object()])
+    def test_retries_validation_error_then_accepts_title_without_tags(self) -> None:
+        parsed = title_response_model(()).model_validate(
+            {
+                "no_tags_explanation": "No tags are available",
+                "tags": {},
+                "title": "Valid title",
+            }
+        )
+        response = Mock(choices=[Mock(message=Mock(parsed=parsed))])
+        response.model_dump.return_value = {"id": "title-response"}
         title_client = Mock()
-        title_client.chat.completions.create.return_value = response
+        title_client.chat.completions.parse.side_effect = [
+            ValueError("invalid structured response"), response
+        ]
         client = Mock()
         client.with_options.return_value = title_client
 
-        with self.assertRaises(AttributeError):
+        self.assertEqual(
+            generate_transcript_title("Full transcript", client, "title-model"),
+            ({"id": "title-response"}, "Valid title", ()),
+        )
+        self.assertEqual(title_client.chat.completions.parse.call_count, 2)
+
+    def test_does_not_retry_permanent_provider_error(self) -> None:
+        response = httpx.Response(
+            400,
+            request=httpx.Request("POST", "https://example.invalid/v1/chat/completions"),
+        )
+        error = BadRequestError("Structured output unsupported", response=response, body=None)
+        title_client = Mock()
+        title_client.chat.completions.parse.side_effect = error
+        client = Mock()
+        client.with_options.return_value = title_client
+
+        with self.assertRaises(BadRequestError):
             generate_transcript_title("Full transcript", client, "title-model")
+        title_client.chat.completions.parse.assert_called_once()
+
+    def test_retries_truncated_response(self) -> None:
+        title_client = Mock()
+        title_client.chat.completions.parse.side_effect = LengthFinishReasonError(
+            completion=Mock()
+        )
+        client = Mock()
+        client.with_options.return_value = title_client
+
+        with self.assertRaises(LengthFinishReasonError):
+            generate_transcript_title("Full transcript", client, "title-model")
+        self.assertEqual(title_client.chat.completions.parse.call_count, 3)
 
 
 class RichMessageTests(unittest.TestCase):
@@ -668,6 +784,8 @@ class HandleAudioTests(unittest.TestCase):
         if bot is None:
             bot = Mock(_post=AsyncMock())
         context = Mock(bot=bot)
+        transcript_store = Mock()
+        transcript_store.list_tags_for_user.return_value = ()
         context.application.bot_data = {
             "allowed_user_ids": {user_id},
             "stage_locks": StageLocks(),
@@ -679,7 +797,7 @@ class HandleAudioTests(unittest.TestCase):
             "title_model": "title-model",
             "converter": "ffmpeg",
             "transcription_scheduler": None,
-            "transcript_store": Mock(),
+            "transcript_store": transcript_store,
             "data_directory": source.parent,
         }
         artifacts = source.parent / "artifacts"
@@ -707,7 +825,7 @@ class HandleAudioTests(unittest.TestCase):
                     TITLE_STATUS,
                 ):
                     await progress(stage)
-                return "final text", "Specific title"
+                return "final text", "Specific title", ("работа",)
 
             transcribe_recording.side_effect = transcribe
             asyncio.run(handle_audio(update, context))
@@ -730,7 +848,7 @@ class HandleAudioTests(unittest.TestCase):
         )
         bot._post.assert_awaited_once()
         self.assertEqual(bot._post.await_args.args[0], "editMessageText")
-        saved = context.application.bot_data["transcript_store"].save.call_args.args[0]
+        saved = context.application.bot_data["transcript_store"].save_with_tags.call_args.args[0]
         self.assertEqual(saved.telegram_user_id, 123)
         self.assertEqual(saved.telegram_chat_id, 123)
         self.assertEqual(saved.telegram_message_id, 456)
@@ -739,11 +857,14 @@ class HandleAudioTests(unittest.TestCase):
         self.assertEqual(saved.text, "final text")
         self.assertEqual(saved.source_audio_path, "audio.ogg")
         self.assertEqual(saved.artifacts_dir, "artifacts")
+        context.application.bot_data["transcript_store"].save_with_tags.assert_called_once_with(
+            saved, ("работа",)
+        )
 
     @patch(
         "bot.transcribe_recording",
         new_callable=AsyncMock,
-        return_value=("final text", "Specific title"),
+        return_value=("final text", "Specific title", ()),
     )
     @patch("bot.recording_paths")
     def test_saves_transcript_before_delivery(
@@ -763,8 +884,8 @@ class HandleAudioTests(unittest.TestCase):
             update, context, _, _, artifacts = self.audio_request(
                 source, status, bot=bot
             )
-            context.application.bot_data["transcript_store"].save.side_effect = (
-                lambda record: events.append("storage")
+            context.application.bot_data["transcript_store"].save_with_tags.side_effect = (
+                lambda record, tags: events.append("storage")
             )
             recording_paths.return_value = (source, artifacts)
 
@@ -775,7 +896,7 @@ class HandleAudioTests(unittest.TestCase):
     @patch(
         "bot.transcribe_recording",
         new_callable=AsyncMock,
-        return_value=("final text", "Specific title"),
+        return_value=("final text", "Specific title", ()),
     )
     @patch("bot.recording_paths")
     def test_storage_failure_prevents_delivery(
@@ -786,7 +907,7 @@ class HandleAudioTests(unittest.TestCase):
             status = Mock(chat_id=123, message_id=789)
             status.edit_text = AsyncMock()
             update, context, _, bot, artifacts = self.audio_request(source, status)
-            context.application.bot_data["transcript_store"].save.side_effect = (
+            context.application.bot_data["transcript_store"].save_with_tags.side_effect = (
                 TranscriptStorageError("database unavailable")
             )
             recording_paths.return_value = (source, artifacts)
@@ -802,7 +923,7 @@ class HandleAudioTests(unittest.TestCase):
     @patch(
         "bot.transcribe_recording",
         new_callable=AsyncMock,
-        return_value=("final text", "Specific title"),
+        return_value=("final text", "Specific title", ()),
     )
     @patch("bot.recording_paths")
     def test_status_creation_failure_still_delivers_successful_transcript(
@@ -869,7 +990,7 @@ class HandleAudioTests(unittest.TestCase):
                     TITLE_STATUS,
                 ):
                     await progress(stage)
-                return "final text", "Specific title"
+                return "final text", "Specific title", ()
 
             transcribe_recording.side_effect = transcribe
             asyncio.run(handle_audio(update, context))
@@ -913,7 +1034,7 @@ class HandleAudioTests(unittest.TestCase):
                     else:
                         second_started.set()
                     await release.wait()
-                    return "final text", "Specific title"
+                    return "final text", "Specific title", ()
 
                 transcribe_recording.side_effect = transcribe
                 first_task = asyncio.create_task(handle_audio(first_update, first_context))
@@ -976,7 +1097,7 @@ class HandleAudioTests(unittest.TestCase):
                         second_started.set()
                     await release.wait()
                     transcript = f"transcript for {source.stem}"
-                    return transcript, f"title for {source.stem}"
+                    return transcript, f"title for {source.stem}", ()
 
                 transcribe_recording.side_effect = transcribe
                 first_task = asyncio.create_task(handle_audio(first_update, first_context))
@@ -1169,7 +1290,7 @@ class UnsupportedMessageTests(unittest.TestCase):
 class TranscribeRecordingTests(unittest.TestCase):
     @patch(
         "bot.generate_transcript_title",
-        return_value=({"text": "Specific title"}, "Specific title"),
+        return_value=({"text": "Specific title"}, "Specific title", ()),
     )
     @patch("bot.merge_transcripts", return_value=({"text": "merged text"}, " merged text "))
     @patch(
@@ -1224,7 +1345,7 @@ class TranscribeRecordingTests(unittest.TestCase):
                 "Specific title\n",
             )
 
-        self.assertEqual(result, ("merged text", "Specific title"))
+        self.assertEqual(result, ("merged text", "Specific title", ()))
         self.assertEqual(
             stages,
             [
@@ -1276,7 +1397,7 @@ class TranscribeRecordingTests(unittest.TestCase):
                             )
                         )
 
-                self.assertEqual(result, (transcript, "a" * 50))
+                self.assertEqual(result, (transcript, "a" * 50, ()))
 
     def test_title_artifact_error_uses_fallback(self) -> None:
         transcript = "a" * 50 + "hidden"
@@ -1300,7 +1421,7 @@ class TranscribeRecordingTests(unittest.TestCase):
                 ),
                 patch(
                     "bot.generate_transcript_title",
-                    return_value=({"text": "title"}, "Specific title"),
+                    return_value=({"text": "title"}, "Specific title", ()),
                 ),
                 patch("bot.save_transcription_artifact", side_effect=save_artifact),
             ):
@@ -1319,7 +1440,7 @@ class TranscribeRecordingTests(unittest.TestCase):
                     )
                 )
 
-        self.assertEqual(result, (transcript, "a" * 50))
+        self.assertEqual(result, (transcript, "a" * 50, ()))
 
     def test_title_cancellation_propagates(self) -> None:
         with TemporaryDirectory() as directory:
@@ -1388,7 +1509,7 @@ class TranscribeRecordingTests(unittest.TestCase):
                     ),
                     patch(
                         "bot.generate_transcript_title",
-                        return_value=({"text": "title"}, "title"),
+                        return_value=({"text": "title"}, "title", ()),
                     ),
                 ):
                     first = asyncio.create_task(
@@ -1450,14 +1571,14 @@ class TranscribeRecordingTests(unittest.TestCase):
                         await asyncio.wait_for(
                             asyncio.gather(first, second), timeout=2
                         ),
-                        [("merged", "title"), ("merged", "title")],
+                        [("merged", "title", ()), ("merged", "title", ())],
                     )
 
         asyncio.run(scenario())
 
     @patch(
         "bot.generate_transcript_title",
-        return_value=({"text": "title"}, "title"),
+        return_value=({"text": "title"}, "title", ()),
     )
     @patch("bot.merge_transcripts", return_value=({"text": "merged"}, "merged"))
     @patch(
@@ -1492,7 +1613,7 @@ class TranscribeRecordingTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(result, ("merged", "title"))
+        self.assertEqual(result, ("merged", "title", ()))
         self.assertEqual(
             statuses,
             [

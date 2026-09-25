@@ -209,6 +209,68 @@ class TranscriptStoreTests(unittest.TestCase):
                     1,
                 )
 
+    def test_save_with_tags_replaces_links_and_keeps_title_atomic(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = TranscriptStore(Path(directory) / "vorec.sqlite3")
+            store.initialize()
+            store.create_tag(101, "work", "Work notes")
+            store.create_tag(101, "travel", "Trips")
+            store.create_tag(202, "work", "Another user's work notes")
+            self.assertEqual(
+                [(tag.name, tag.description) for tag in store.list_tags_for_user(101)],
+                [("travel", "Trips"), ("work", "Work notes")],
+            )
+            store.save_with_tags(
+                transcript_record(
+                    telegram_user_id=202,
+                    telegram_chat_id=404,
+                    telegram_message_id=505,
+                    source_audio_path="voices/other.ogg",
+                    artifacts_dir="transcripts/other",
+                ),
+                ("travel",),
+            )
+            other = store.list_for_user(202)
+            self.assertEqual(len(other), 1)
+            self.assertEqual(other[0].tags, ())
+
+            store.save_with_tags(transcript_record(), ("work", "travel"))
+            detail = store.get_for_user(store.list_for_user(101)[0].id, 101)
+            self.assertEqual([tag.name for tag in detail.tags], ["travel", "work"])
+
+            updated = transcript_record(title="Updated title")
+            with self.assertRaisesRegex(TranscriptStorageError, "unique"):
+                store.save_with_tags(updated, ("work", "work"))
+            detail = store.get_for_user(detail.id, 101)
+            self.assertEqual(detail.title, "Specific title")
+            self.assertEqual([tag.name for tag in detail.tags], ["travel", "work"])
+
+            store.save_with_tags(updated, ())
+            detail = store.get_for_user(detail.id, 101)
+            self.assertEqual(detail.title, "Updated title")
+            self.assertEqual(detail.tags, ())
+
+    def test_save_with_tags_skips_tag_deleted_during_transcription(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = TranscriptStore(Path(directory) / "vorec.sqlite3")
+            store.initialize()
+            store.create_tag(101, "work", "Work notes")
+            store.create_tag(101, "travel", "Trips")
+            available_tags = store.list_tags_for_user(101)
+
+            with store._connect() as connection:
+                connection.execute(
+                    "DELETE FROM tags WHERE telegram_user_id = ? AND name = ?",
+                    (101, "travel"),
+                )
+
+            store.save_with_tags(
+                transcript_record(), tuple(tag.name for tag in available_tags)
+            )
+            records = store.list_for_user(101)
+            self.assertEqual(len(records), 1)
+            self.assertEqual([tag.name for tag in records[0].tags], ["work"])
+
     def test_migrates_empty_version_two_tags_and_refuses_nonempty_tags(self) -> None:
         with TemporaryDirectory() as directory:
             database = Path(directory) / "vorec.sqlite3"

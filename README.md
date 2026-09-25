@@ -42,9 +42,12 @@ Telegram → Tailscale Funnel → tailscale-ingress → bot container
 - **Merge model** receives both transcripts through the primary inference provider and combines
   their best-supported readings into one readable result. Both transcriptions are always
   made: the bot does not currently try to judge the quality of the first result.
-- **Title model** receives the merged transcript through the primary inference provider and
-  creates the short, distinctive title shown on the collapsed result. The optional `TITLE_MODEL`
-  environment variable selects the title model.
+- **Title model** receives the merged transcript and the user's available tag names and
+  descriptions through the primary inference provider. One structured response creates the
+  short title and gives a true/false decision for every personal tag, with an explanation
+  when none match. The optional `TITLE_MODEL` environment variable selects the model.
+  After three unsuccessful attempts, the bot saves the transcript
+  with its first 50 characters as the title and no tags.
 - **oMLX** is the current local inference provider. It is not required by the architecture:
   configure any OpenAI-compatible providers with `INFERENCE_API_URL`, `INFERENCE_API_KEY`,
   `SECONDARY_INFERENCE_API_URL`, and `SECONDARY_INFERENCE_API_KEY`.
@@ -127,8 +130,9 @@ does not contain request headers or response bodies. Keep these logs private:
 detail paths contain transcript IDs, and list queries contain the timezone.
 
 Tags are personal to a user. Their stored names are lowercase without `#`, and
-the `#` prefix is added in the UI. Another process may populate tags later;
-until then, the tag view shows an **Uncategorized** group. A database upgrade from
+the `#` prefix is added in the UI. Another process may populate the available tags;
+the bot then assigns them to new transcripts. Until tags are available, the tag view
+shows an **Uncategorized** group. A database upgrade from
 schema version 2 expects both tag tables to be empty and stops safely if it
 finds existing tag data.
 
