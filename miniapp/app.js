@@ -21,6 +21,9 @@
   const tabs = {date: document.getElementById("date-tab"), tags: document.getElementById("tags-tab")};
   let currentView = "date";
   let requestNumber = 0;
+  let tagRequestNumber = 0;
+  let settingsSession = 0;
+  let currentDetailId = null;
   let currentTags = [];
   let editingTagId = null;
 
@@ -122,6 +125,8 @@
 
   function showList() {
     ++requestNumber;
+    ++tagRequestNumber;
+    ++settingsSession;
     detailScreen.hidden = true;
     const returningFromSettings = !settingsScreen.hidden;
     settingsScreen.hidden = true;
@@ -133,6 +138,7 @@
 
   async function openDetail(id) {
     const request = ++requestNumber;
+    currentDetailId = id;
     listScreen.hidden = true;
     settingsScreen.hidden = true;
     detailScreen.hidden = false;
@@ -181,6 +187,16 @@
     return button;
   }
 
+  async function refreshAfterTagChange(session) {
+    if (!settingsScreen.hidden) {
+      if (session === settingsSession || editingTagId === null) await loadTags();
+    } else if (!listScreen.hidden) {
+      await loadList();
+    } else if (!detailScreen.hidden && currentDetailId !== null) {
+      await openDetail(currentDetailId);
+    }
+  }
+
   function makeTagEditor(tag) {
     const isNew = tag === null;
     const card = document.createElement("article");
@@ -225,6 +241,7 @@
     });
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
+      const session = settingsSession;
       save.disabled = true;
       cancel.disabled = true;
       errorMessage.textContent = "";
@@ -234,10 +251,12 @@
           headers: {"Content-Type": "application/json"},
           body: JSON.stringify({name: name.value, description: description.value}),
         });
-        editingTagId = null;
-        await loadTags();
+        if (session === settingsSession) editingTagId = null;
+        await refreshAfterTagChange(session);
       } catch (error) {
-        errorMessage.textContent = error.message;
+        if (session === settingsSession && !settingsScreen.hidden) {
+          errorMessage.textContent = error.message;
+        }
       } finally {
         save.disabled = false;
         cancel.disabled = false;
@@ -287,13 +306,16 @@
       remove.disabled = editingTagId !== null;
       remove.addEventListener("click", async () => {
         if (!window.confirm(`Delete #${tag.name}? It will be removed from existing memos.`)) return;
+        const session = settingsSession;
         remove.disabled = true;
         settingsStatus.textContent = "";
         try {
           await api(`api/tags/${tag.id}`, {method: "DELETE"});
-          await loadTags();
+          await refreshAfterTagChange(session);
         } catch (error) {
-          settingsStatus.textContent = error.message;
+          if (session === settingsSession && !settingsScreen.hidden) {
+            settingsStatus.textContent = error.message;
+          }
           remove.disabled = false;
         }
       });
@@ -305,26 +327,29 @@
   }
 
   async function loadTags() {
-    const request = ++requestNumber;
+    const request = ++tagRequestNumber;
     addTagButton.disabled = true;
     tagList.replaceChildren();
     settingsStatus.textContent = "Loading…";
     try {
       const result = await api("api/tags");
-      if (request === requestNumber) {
+      if (request === tagRequestNumber && !settingsScreen.hidden) {
         currentTags = result.tags;
         renderTags();
         settingsStatus.textContent = "";
       }
     } catch (error) {
-      if (request === requestNumber) settingsStatus.textContent = error.message;
+      if (request === tagRequestNumber && !settingsScreen.hidden) {
+        settingsStatus.textContent = error.message;
+      }
     } finally {
-      if (request === requestNumber) addTagButton.disabled = false;
+      if (request === tagRequestNumber && !settingsScreen.hidden) addTagButton.disabled = false;
     }
   }
 
   function openSettings() {
     ++requestNumber;
+    ++settingsSession;
     listScreen.hidden = true;
     settingsScreen.hidden = false;
     editingTagId = null;
