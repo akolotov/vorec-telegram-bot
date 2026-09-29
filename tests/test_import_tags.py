@@ -1,13 +1,32 @@
+import json
 import sqlite3
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from vorec.import_tags import TagImportError, import_default_tags, load_default_tags
 from vorec.storage import TranscriptRecord, TranscriptStore
 
 
+TEST_TAGS = (
+    ("notes", "Personal notes"),
+    ("plans", "Future plans"),
+)
+
+
 class DefaultTagImportTests(unittest.TestCase):
+    def setUp(self) -> None:
+        catalog_path = patch("vorec.import_tags.DEFAULT_TAGS_PATH")
+        mocked_path = catalog_path.start()
+        self.addCleanup(catalog_path.stop)
+        mocked_path.read_text.return_value = json.dumps({
+            "tags": [
+                {"name": name, "description": description}
+                for name, description in TEST_TAGS
+            ]
+        })
+
     def test_imports_all_tags_into_empty_database_and_refuses_repeat(self) -> None:
         with TemporaryDirectory() as directory:
             database = Path(directory) / "vorec.sqlite3"
@@ -18,6 +37,7 @@ class DefaultTagImportTests(unittest.TestCase):
             actual = store.list_tags_for_user(101)
             expected = load_default_tags()
 
+            self.assertEqual(expected, TEST_TAGS)
             self.assertEqual(count, len(expected))
             self.assertEqual(
                 {tag.name: tag.description for tag in actual}, dict(expected)
@@ -36,8 +56,8 @@ class DefaultTagImportTests(unittest.TestCase):
                 connection.execute("DROP TABLE tag_id_allocations")
                 connection.execute("PRAGMA user_version = 3")
 
-            self.assertEqual(import_default_tags(database, user_id=101), 17)
-            self.assertEqual(len(store.list_tags_for_user(101)), 17)
+            self.assertEqual(import_default_tags(database, user_id=101), len(TEST_TAGS))
+            self.assertEqual(len(store.list_tags_for_user(101)), len(TEST_TAGS))
 
     def test_refuses_wrong_owner_without_importing_tags(self) -> None:
         with TemporaryDirectory() as directory:
