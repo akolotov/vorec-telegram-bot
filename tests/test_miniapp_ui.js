@@ -84,7 +84,7 @@ function flush() {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
-test("Apply blocks both back paths and a second submit until the save completes", async () => {
+test("Tag picker blocks navigation during save and handles failed saves", async () => {
   const registry = {};
   const ids = [
     "list-screen", "detail-screen", "settings-screen", "tag-picker-screen",
@@ -107,6 +107,7 @@ test("Apply blocks both back paths and a second submit until the save completes"
   let puts = 0;
   let finishPut;
   let rejectNextPut = false;
+  let sessionExpired = false;
   const initial = {
     id: 1, created_at: "2026-09-24T10:00:00+00:00", title: "Memo",
     text: "Text", tags: ["work"], tag_ids: [1],
@@ -132,6 +133,7 @@ test("Apply blocks both back paths and a second submit until the save completes"
     }},
   };
   const fetch = async (url, options) => {
+    if (sessionExpired) return {ok: false, status: 401};
     if (url.pathname.endsWith("/api/groups")) {
       groupReads++;
       return response({groups: [{key: "2026-09-24", items: [{
@@ -207,4 +209,16 @@ test("Apply blocks both back paths and a second submit until the save completes"
   await registry["tag-picker-cancel"].dispatch("click");
   assert.equal(registry["detail-screen"].hidden, false);
   assert.equal(registry["detail-tags"].children[0].textContent, "#travel");
+
+  await registry["edit-detail-tags"].dispatch("click");
+  await flush();
+  const expiredInputs = registry["tag-picker-list"].querySelectorAll("input");
+  expiredInputs.find((input) => input.value === "1").checked = true;
+  expiredInputs.find((input) => input.value === "2").checked = false;
+  sessionExpired = true;
+  await registry["tag-picker-form"].dispatch("submit");
+  assert.equal(registry["tag-picker-screen"].hidden, false);
+  await registry["tag-picker-cancel"].dispatch("click");
+  assert.equal(registry["tag-picker-screen"].hidden, true);
+  assert.equal(registry["detail-screen"].hidden, false);
 });

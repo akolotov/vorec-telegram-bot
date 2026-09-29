@@ -73,6 +73,12 @@
     }
   }
 
+  function httpError(message, status) {
+    const error = new Error(message);
+    error.status = status;
+    return error;
+  }
+
   async function api(path, options = {}) {
     let response;
     try {
@@ -84,18 +90,19 @@
     } catch (_) {
       throw new Error("Network error. Please try again.");
     }
-    if (response.status === 401) throw new Error("Сессия завершилась. Откройте приложение снова из меню бота.");
-    if (response.status === 409) throw new Error("A category with this name already exists.");
-    if (response.status === 404) throw new Error(
+    if (response.status === 401) throw httpError("Сессия завершилась. Откройте приложение снова из меню бота.", 401);
+    if (response.status === 409) throw httpError("A category with this name already exists.", 409);
+    if (response.status === 404) throw httpError(
       path.startsWith("api/transcripts/")
         ? "Memo not found. Refresh the list."
-        : "Category not found. Refresh the list."
+        : "Category not found. Refresh the list.",
+      404
     );
     if (response.status === 400) {
       const result = await response.json();
-      throw new Error(result.error || "Invalid category details.");
+      throw httpError(result.error || "Invalid category details.", 400);
     }
-    if (!response.ok) throw new Error("The request failed. Please try again.");
+    if (!response.ok) throw httpError("The request failed. Please try again.", response.status);
     if (response.status === 204) return null;
     return response.json();
   }
@@ -331,9 +338,12 @@
       saveUncertain = false;
       returnToDetail();
     } catch (error) {
-      saveUncertain = true;
-      detailDirty = true;
-      tagPickerStatus.textContent = `${error.message} Retry Apply or Cancel to check saved tags.`;
+      const rejected = [400, 401, 404, 409, 415].includes(error.status);
+      saveUncertain ||= !rejected;
+      detailDirty ||= saveUncertain || error.status === 404;
+      tagPickerStatus.textContent = saveUncertain
+        ? `${error.message} Retry Apply or Cancel to check saved tags.`
+        : error.message;
     } finally {
       savePending = false;
       setPickerBusy(false);
