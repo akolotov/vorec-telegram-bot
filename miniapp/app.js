@@ -24,6 +24,7 @@
   let tagRequestNumber = 0;
   let settingsSession = 0;
   let currentDetailId = null;
+  let listAnchor = null;
   let currentTags = [];
   let editingTagId = null;
 
@@ -99,11 +100,15 @@
         const button = document.createElement("button");
         button.type = "button";
         button.className = "transcript";
+        button.dataset.transcriptId = String(item.id);
         const title = document.createElement("span");
         title.className = "transcript-title";
         title.textContent = item.title;
         button.append(title, makeTags(item.tags));
-        button.addEventListener("click", () => openDetail(item.id));
+        button.addEventListener("click", () => {
+          listAnchor = {id: item.id, top: button.getBoundingClientRect().top};
+          openDetail(item.id);
+        });
         section.append(button);
       });
       groupsElement.append(section);
@@ -127,12 +132,27 @@
     ++requestNumber;
     ++tagRequestNumber;
     ++settingsSession;
+    const returningFromDetail = !detailScreen.hidden;
     detailScreen.hidden = true;
     const returningFromSettings = !settingsScreen.hidden;
     settingsScreen.hidden = true;
     listScreen.hidden = false;
     webApp?.BackButton?.hide();
-    window.scrollTo(0, 0);
+    if (returningFromDetail && listAnchor) {
+      const anchor = listAnchor;
+      const restoreRequest = requestNumber;
+      requestAnimationFrame(() => {
+        if (listScreen.hidden || restoreRequest !== requestNumber) return;
+        const button = groupsElement.querySelector(`[data-transcript-id="${anchor.id}"]`);
+        if (button) {
+          window.scrollTo(0, window.scrollY + button.getBoundingClientRect().top - anchor.top);
+        } else {
+          window.scrollTo(0, 0);
+        }
+      });
+    } else {
+      window.scrollTo(0, 0);
+    }
     if (returningFromSettings) loadList();
   }
 
