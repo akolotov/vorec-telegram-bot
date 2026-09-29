@@ -27,6 +27,7 @@ button { font: inherit; }
 }
 .header { margin-bottom: 22px; }
 .header-title { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.header-actions { display: flex; flex: none; gap: 4px; }
 h1 { margin: 0 0 20px; font-size: 29px; line-height: 1.2; letter-spacing: -.02em; }
 .tabs {
   display: flex;
@@ -77,6 +78,9 @@ h1 { margin: 0 0 20px; font-size: 29px; line-height: 1.2; letter-spacing: -.02em
 .icon-button { display: inline-flex; align-items: center; justify-content: center; flex: none; width: 40px; height: 40px; padding: 0; border: 0; border-radius: 10px; background: transparent; color: var(--muted); cursor: pointer; }
 .icon-button:hover, .icon-button:focus-visible { background: var(--background); color: var(--text); }
 .icon-button svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.header-actions .icon-button svg { width: 22px; height: 22px; }
+#refresh-button svg { stroke-width: 2.2; }
+.icon-button svg.filled-icon { fill: currentColor; stroke: none; }
 .tag-form { display: grid; gap: 8px; }
 .tag-form h2 { margin: 0 0 4px; font-size: 18px; }
 .tag-form label { font-weight: 600; font-size: 14px; }

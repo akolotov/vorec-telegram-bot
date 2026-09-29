@@ -92,7 +92,7 @@ test("Tag picker blocks navigation during save and handles failed saves", async 
     "detail-status", "detail", "date-tab", "tags-tab", "detail-date",
     "detail-title", "detail-tags", "detail-text", "tag-picker-list",
     "tag-picker-status", "tag-picker-apply", "tag-picker-cancel",
-    "tag-picker-form", "settings-button", "settings-back-button", "back-button",
+    "tag-picker-form", "refresh-button", "settings-button", "settings-back-button", "back-button",
     "edit-detail-tags",
   ];
   ids.forEach((id) => { new Element("div", registry).id = id; });
@@ -221,4 +221,98 @@ test("Tag picker blocks navigation during save and handles failed saves", async 
   await registry["tag-picker-cancel"].dispatch("click");
   assert.equal(registry["tag-picker-screen"].hidden, true);
   assert.equal(registry["detail-screen"].hidden, false);
+});
+
+test("Refresh reloads the current view at the top and preserves detail return position", async () => {
+  const registry = {};
+  const ids = [
+    "list-screen", "detail-screen", "settings-screen", "tag-picker-screen",
+    "settings-status", "tag-list", "add-tag-button", "groups", "list-status",
+    "detail-status", "detail", "date-tab", "tags-tab", "detail-date",
+    "detail-title", "detail-tags", "detail-text", "tag-picker-list",
+    "tag-picker-status", "tag-picker-apply", "tag-picker-cancel",
+    "tag-picker-form", "refresh-button", "settings-button", "settings-back-button",
+    "back-button", "edit-detail-tags",
+  ];
+  ids.forEach((id) => { new Element("div", registry).id = id; });
+  registry["detail-tags"].parent = new Element("div", registry);
+  registry["detail-tags"].parent.append(registry["detail-tags"]);
+  registry["detail-screen"].hidden = true;
+  registry["settings-screen"].hidden = true;
+  registry["tag-picker-screen"].hidden = true;
+  const window = {
+    location: {href: "https://example.test/apps/bot/"},
+    scrollY: 0,
+    scrollTo(_x, y) { this.scrollY = y; },
+    Telegram: {WebApp: {
+      initData: "signed-data", ready() {}, expand() {},
+      BackButton: {onClick() {}, hide() {}, show() {}},
+    }},
+  };
+  const document = {
+    getElementById: (id) => registry[id],
+    createElement: (tag) => new Element(tag, registry),
+    createTextNode: (value) => new Element(value, registry),
+  };
+  let groupReads = 0;
+  let nextGroupResponse;
+  const views = [];
+  const items = [{id: 1, title: "Memo", tags: ["work"]}];
+  const fetch = async (url) => {
+    if (url.pathname.endsWith("/api/groups")) {
+      groupReads++;
+      views.push(url.searchParams.get("view"));
+      if (nextGroupResponse) {
+        const pending = nextGroupResponse;
+        nextGroupResponse = null;
+        return pending;
+      }
+      return response({groups: [{tag: "work", items}]});
+    }
+    if (url.pathname.endsWith("/api/transcripts/1")) {
+      return response({
+        id: 1, created_at: "2026-09-24T10:00:00+00:00", title: "Memo",
+        text: "Text", tags: ["work"], tag_ids: [1],
+      });
+    }
+    throw new Error(`Unexpected request: ${url}`);
+  };
+  const source = fs.readFileSync(path.join(__dirname, "../miniapp/app.js"), "utf8");
+  vm.runInNewContext(source, {
+    document, window, fetch, URL, URLSearchParams, Intl,
+    requestAnimationFrame: (callback) => callback(),
+  });
+  await flush();
+  await registry["tags-tab"].dispatch("click");
+  await flush();
+  window.scrollY = 420;
+  let finishRefresh;
+  nextGroupResponse = new Promise((resolve) => { finishRefresh = resolve; });
+  const refreshing = registry["refresh-button"].dispatch("click");
+  assert.equal(window.scrollY, 0);
+  assert.equal(registry["refresh-button"].disabled, true);
+  await registry["refresh-button"].dispatch("click");
+  assert.equal(groupReads, 3);
+  finishRefresh(response({groups: [{tag: "work", items: [
+    {id: 2, title: "New memo", tags: ["work"]}, ...items,
+  ]}]}));
+  await refreshing;
+  assert.equal(registry["refresh-button"].disabled, false);
+  assert.equal(views.at(-1), "tags");
+  assert.equal(registry.groups.querySelector('[data-transcript-id="2"]').children[0].textContent, "New memo");
+
+  nextGroupResponse = Promise.reject(new Error("Connection lost"));
+  await registry["refresh-button"].dispatch("click");
+  assert.equal(registry["refresh-button"].disabled, false);
+  assert.equal(registry["list-status"].children.at(-1).textContent, "Повторить");
+  await registry["list-status"].children.at(-1).dispatch("click");
+  assert.equal(groupReads, 5);
+
+  window.scrollY = 420;
+  const memoButton = registry.groups.querySelector('[data-transcript-id="1"]');
+  memoButton.getBoundingClientRect = () => ({top: 520 - window.scrollY});
+  await memoButton.dispatch("click");
+  await registry["back-button"].dispatch("click");
+  assert.equal(window.scrollY, 420);
+  assert.equal(groupReads, 5);
 });

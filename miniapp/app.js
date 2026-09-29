@@ -21,6 +21,7 @@
   const addTagButton = document.getElementById("add-tag-button");
   const groupsElement = document.getElementById("groups");
   const listStatus = document.getElementById("list-status");
+  const refreshButton = document.getElementById("refresh-button");
   const detailStatus = document.getElementById("detail-status");
   const detailElement = document.getElementById("detail");
   const tabs = {date: document.getElementById("date-tab"), tags: document.getElementById("tags-tab")};
@@ -156,6 +157,7 @@
 
   async function loadList(anchor = null) {
     const request = ++requestNumber;
+    refreshButton.disabled = true;
     groupsElement.replaceChildren();
     listStatus.textContent = "Загрузка…";
     try {
@@ -169,6 +171,8 @@
       if (request === requestNumber) {
         showError(listStatus, error.message, () => loadList(anchor));
       }
+    } finally {
+      if (request === requestNumber) refreshButton.disabled = false;
     }
   }
 
@@ -556,6 +560,11 @@
 
   tabs.date.addEventListener("click", () => setView("date"));
   tabs.tags.addEventListener("click", () => setView("tags"));
+  refreshButton.addEventListener("click", () => {
+    if (refreshButton.disabled) return;
+    window.scrollTo(0, 0);
+    return loadList();
+  });
   document.getElementById("settings-button").addEventListener("click", openSettings);
   document.getElementById("settings-back-button").addEventListener("click", showList);
   addTagButton.addEventListener("click", () => {
