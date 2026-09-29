@@ -40,7 +40,7 @@ def create_web_application(
     transcript_store: TranscriptStore,
     configure_menu_buttons,
 ) -> Starlette:
-    """Serve bot updates, a static Mini App, and authenticated read-only API."""
+    """Serve bot updates, a static Mini App, and its authenticated API."""
 
     async def telegram_webhook(request: Request) -> Response:
         if not secrets.compare_digest(
@@ -115,13 +115,47 @@ def create_web_application(
             return JSONResponse({"error": "Not found"}, status_code=404, headers=NO_STORE)
         return JSONResponse(transcript_detail(record), headers=NO_STORE)
 
+    async def update_transcript_tags(request: Request) -> Response:
+        user_id = authenticated_user(request)
+        if user_id is None:
+            return JSONResponse({"error": "Unauthorized"}, status_code=401, headers=NO_STORE)
+        if request.headers.get("content-type", "").partition(";")[0] != "application/json":
+            return JSONResponse({"error": "Expected JSON"}, status_code=415, headers=NO_STORE)
+        try:
+            body = await request.json()
+        except ValueError:
+            return JSONResponse({"error": "Invalid JSON"}, status_code=400, headers=NO_STORE)
+        tag_ids = body.get("tag_ids") if isinstance(body, dict) else None
+        if (
+            not isinstance(tag_ids, list)
+            or any(type(tag_id) is not int or tag_id <= 0 for tag_id in tag_ids)
+            or len(tag_ids) != len(set(tag_ids))
+        ):
+            return JSONResponse({"error": "Invalid tag IDs"}, status_code=400, headers=NO_STORE)
+        try:
+            transcript_id = int(request.path_params["transcript_id"])
+            updated = transcript_store.replace_tags_for_user(
+                transcript_id, user_id, tuple(tag_ids)
+            )
+            if not updated:
+                return JSONResponse({"error": "Not found"}, status_code=404, headers=NO_STORE)
+            record = transcript_store.get_for_user(transcript_id, user_id)
+        except TagValidationError as error:
+            return JSONResponse({"error": str(error)}, status_code=400, headers=NO_STORE)
+        except TranscriptStorageError:
+            LOGGER.exception("Could not update transcript tags.")
+            return JSONResponse({"error": "Unavailable"}, status_code=500, headers=NO_STORE)
+        if record is None:
+            return JSONResponse({"error": "Not found"}, status_code=404, headers=NO_STORE)
+        return JSONResponse(transcript_detail(record), headers=NO_STORE)
+
     async def tags(request: Request) -> Response:
         user_id = authenticated_user(request)
         if user_id is None:
             return JSONResponse({"error": "Unauthorized"}, status_code=401, headers=NO_STORE)
         if request.method == "GET":
             try:
-                owned_tags = transcript_store.list_tags_for_user(user_id)
+                owned_tags = transcript_store.list_tag_usage_for_user(user_id)
             except TranscriptStorageError:
                 LOGGER.exception("Could not load tags.")
                 return JSONResponse({"error": "Unavailable"}, status_code=500, headers=NO_STORE)
@@ -217,6 +251,11 @@ def create_web_application(
             Route(app_path + "styles.css", stylesheet, methods=["GET"]),
             Route(app_path + "api/groups", groups, methods=["GET"]),
             Route(app_path + "api/transcripts/{transcript_id:int}", detail, methods=["GET"]),
+            Route(
+                app_path + "api/transcripts/{transcript_id:int}/tags",
+                update_transcript_tags,
+                methods=["PUT"],
+            ),
             Route(app_path + "api/tags", tags, methods=["GET", "POST"]),
             Route(app_path + "api/tags/{tag_id:int}", tag, methods=["PUT", "DELETE"]),
         ],

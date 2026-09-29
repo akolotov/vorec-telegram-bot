@@ -286,6 +286,65 @@ class TranscriptStoreTests(unittest.TestCase):
             self.assertEqual(detail.title, "Updated title")
             self.assertEqual(detail.tags, ())
 
+    def test_replace_owned_transcript_tags_and_count_usage(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = TranscriptStore(Path(directory) / "vorec.sqlite3")
+            store.initialize()
+            work = store.create_tag(101, "work", "Work notes")
+            travel = store.create_tag(101, "travel", "Trips")
+            store.create_tag(101, "unused", "Unused")
+            other_tag = store.create_tag(202, "work", "Private")
+            first = transcript_record()
+            second = transcript_record(
+                title="Second title",
+                telegram_message_id=304,
+                source_audio_path="voices/second.ogg",
+                artifacts_dir="transcripts/second",
+            )
+            other = transcript_record(
+                telegram_user_id=202,
+                telegram_chat_id=404,
+                telegram_message_id=505,
+                source_audio_path="voices/other.ogg",
+                artifacts_dir="transcripts/other",
+            )
+            store.save_with_tags(first, (work.id,))
+            store.save_with_tags(second, (work.id, travel.id))
+            store.save_with_tags(other, (other_tag.id,))
+            first_id = next(
+                record.id for record in store.list_for_user(101)
+                if record.title == first.title
+            )
+            other_id = store.list_for_user(202)[0].id
+            self.assertEqual(
+                [(tag.name, tag.usage_count) for tag in store.list_tag_usage_for_user(101)],
+                [("travel", 1), ("unused", 0), ("work", 2)],
+            )
+
+            self.assertFalse(store.replace_tags_for_user(other_id, 101, (travel.id,)))
+            with self.assertRaises(TagValidationError):
+                store.replace_tags_for_user(first_id, 101, (travel.id, other_tag.id))
+            with self.assertRaises(TagValidationError):
+                store.replace_tags_for_user(first_id, 101, (work.id, work.id))
+            self.assertEqual(
+                [tag.id for tag in store.get_for_user(first_id, 101).tags], [work.id]
+            )
+            self.assertTrue(store.replace_tags_for_user(first_id, 101, (travel.id,)))
+            self.assertEqual(
+                [tag.name for tag in store.get_for_user(first_id, 101).tags], ["travel"]
+            )
+            self.assertEqual(store.get_for_user(first_id, 101).text, first.text)
+            self.assertEqual(
+                [(tag.name, tag.usage_count) for tag in store.list_tag_usage_for_user(101)],
+                [("travel", 2), ("unused", 0), ("work", 1)],
+            )
+            self.assertTrue(store.replace_tags_for_user(first_id, 101, ()))
+            self.assertTrue(store.replace_tags_for_user(first_id, 101, ()))
+            self.assertEqual(store.get_for_user(first_id, 101).tags, ())
+            self.assertEqual(
+                [tag.id for tag in store.list_for_user(202)[0].tags], [other_tag.id]
+            )
+
     def test_save_with_tags_skips_tag_deleted_during_transcription(self) -> None:
         with TemporaryDirectory() as directory:
             store = TranscriptStore(Path(directory) / "vorec.sqlite3")

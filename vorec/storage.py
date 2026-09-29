@@ -49,6 +49,11 @@ class TagDefinition(TagRecord):
 
 
 @dataclass(frozen=True)
+class TagUsage(TagDefinition):
+    usage_count: int
+
+
+@dataclass(frozen=True)
 class TranscriptSummary:
     id: int
     created_at: str
@@ -351,6 +356,59 @@ class TranscriptStore:
         except (OSError, sqlite3.Error) as error:
             raise TranscriptStorageError("Could not read personal tags.") from error
         return tuple(TagDefinition(*row) for row in rows)
+
+    def list_tag_usage_for_user(self, telegram_user_id: int) -> tuple[TagUsage, ...]:
+        """Read personal tags with the number of transcripts using each tag."""
+        try:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    """SELECT tag.id, tag.name, tag.description, COUNT(tt.transcript_id)
+                    FROM tags AS tag
+                    LEFT JOIN transcript_tags AS tt ON tt.tag_id = tag.id
+                    WHERE tag.telegram_user_id = ?
+                    GROUP BY tag.id
+                    ORDER BY tag.name, tag.id""",
+                    (telegram_user_id,),
+                ).fetchall()
+        except (OSError, sqlite3.Error) as error:
+            raise TranscriptStorageError("Could not read personal tag usage.") from error
+        return tuple(TagUsage(*row) for row in rows)
+
+    def replace_tags_for_user(
+        self, transcript_id: int, telegram_user_id: int, tag_ids: tuple[int, ...]
+    ) -> bool:
+        """Replace an owned transcript's tag links atomically."""
+        if len(tag_ids) != len(set(tag_ids)):
+            raise TagValidationError("Tag IDs must be unique.")
+        try:
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                owned = connection.execute(
+                    "SELECT 1 FROM transcripts WHERE id = ? AND telegram_user_id = ?",
+                    (transcript_id, telegram_user_id),
+                ).fetchone()
+                if owned is None:
+                    return False
+                for tag_id in tag_ids:
+                    tag = connection.execute(
+                        "SELECT 1 FROM tags WHERE id = ? AND telegram_user_id = ?",
+                        (tag_id, telegram_user_id),
+                    ).fetchone()
+                    if tag is None:
+                        raise TagValidationError("A selected tag does not exist.")
+                connection.execute(
+                    "DELETE FROM transcript_tags WHERE transcript_id = ?", (transcript_id,)
+                )
+                connection.executemany(
+                    "INSERT INTO transcript_tags (transcript_id, tag_id, telegram_user_id) "
+                    "VALUES (?, ?, ?)",
+                    [(transcript_id, tag_id, telegram_user_id) for tag_id in tag_ids],
+                )
+                return True
+        except TagValidationError:
+            raise
+        except (OSError, sqlite3.Error) as error:
+            raise TranscriptStorageError("Could not update transcript tags.") from error
 
     def list_all_records(self) -> list[TranscriptRecord]:
         """Read every complete transcript for archive metadata regeneration."""
