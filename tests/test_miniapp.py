@@ -216,7 +216,7 @@ class MiniAppWebTests(unittest.TestCase):
             with TestClient(web) as client:
                 page = client.get("/apps/bot/")
                 self.assertEqual(page.status_code, 200)
-                for label in ("Memos", "By Date", "By Categories", "← Back"):
+                for label in ("Memos", "By Date", "By Categories", "← Back", "Edit tags", "Apply", "Cancel"):
                     self.assertIn(label, page.text)
                 self.assertNotIn("Ваши заметки", page.text)
                 script = client.get("/apps/bot/app.js")
@@ -233,6 +233,7 @@ class MiniAppWebTests(unittest.TestCase):
                 self.assertEqual(client.get("/apps/bot/api/groups?view=tags&timezone=bad", headers=headers).status_code, 400)
                 detail = client.get(f"/apps/bot/api/transcripts/{own_id}", headers=headers)
                 self.assertEqual(detail.json()["text"], "Private text")
+                self.assertEqual(detail.json()["tag_ids"], [])
                 self.assertEqual(client.get(f"/apps/bot/api/transcripts/{other_id}", headers=headers).status_code, 404)
                 self.assertEqual(client.get("/apps/bot/api/tags").status_code, 401)
                 self.assertEqual(client.post("/apps/bot/api/tags", json={"name": "work", "description": "Work"}).status_code, 401)
@@ -242,7 +243,10 @@ class MiniAppWebTests(unittest.TestCase):
                 tag_id = created.json()["id"]
                 self.assertEqual(created.json()["name"], "work")
                 self.assertEqual(created.json()["description"], "Work notes")
-                self.assertEqual(client.get("/apps/bot/api/tags", headers=headers).json()["tags"], [created.json()])
+                self.assertEqual(
+                    client.get("/apps/bot/api/tags", headers=headers).json()["tags"],
+                    [{**created.json(), "usage_count": 0}],
+                )
                 self.assertEqual(client.post("/apps/bot/api/tags", json={"name": "WORK", "description": "Duplicate"}, headers=headers).status_code, 409)
                 self.assertEqual(client.post("/apps/bot/api/tags", json={"name": " ", "description": "Invalid"}, headers=headers).status_code, 400)
                 self.assertEqual(client.post("/apps/bot/api/tags", json={"name": "valid"}, headers=headers).status_code, 400)
@@ -269,6 +273,81 @@ class MiniAppWebTests(unittest.TestCase):
                 self.assertFalse(application.update_queue.empty())
             configure_menu.assert_awaited_once()
             self.assertEqual(application.events, ["initialize", "start", "set_webhook", "stop", "shutdown"])
+
+    def test_tag_assignment_api_validates_and_regroups(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = TranscriptStore(Path(directory) / "database.sqlite3")
+            store.initialize()
+            store.save(TranscriptRecord(
+                101, 101, 1, "2026-09-24T10:00:00+00:00", "Mine", "My text",
+                "voices/mine.ogg", "transcripts/mine",
+            ))
+            store.save(TranscriptRecord(
+                202, 202, 2, "2026-09-24T11:00:00+00:00", "Other", "Other text",
+                "voices/other.ogg", "transcripts/other",
+            ))
+            work = store.create_tag(101, "work", "Work notes")
+            travel = store.create_tag(101, "travel", "Trips")
+            other_tag = store.create_tag(202, "private", "Private notes")
+            own_id = store.list_for_user(101)[0].id
+            other_id = store.list_for_user(202)[0].id
+            web = create_web_application(
+                FakeApplication(),
+                webhook_path="/hooks/bot/telegram/webhook",
+                webhook_url="https://example.test/hooks/bot/telegram/webhook",
+                webhook_secret_token="webhook-secret",
+                app_path="/apps/bot/",
+                bot_token=TOKEN,
+                allowed_user_ids={101},
+                transcript_store=store,
+                configure_menu_buttons=AsyncMock(),
+            )
+            headers = {"X-Telegram-Init-Data": signed_data([
+                ("auth_date", str(int(time.time()))), ("user", '{"id":101}'),
+            ])}
+            url = f"/apps/bot/api/transcripts/{own_id}"
+            tag_url = url + "/tags"
+            with TestClient(web) as client:
+                self.assertEqual(client.put(tag_url, json={"tag_ids": [work.id]}).status_code, 401)
+                self.assertEqual(client.put(tag_url, content=b"{}", headers=headers).status_code, 415)
+                for bad_ids in ([True], [work.id, work.id], [other_tag.id], [999999]):
+                    self.assertEqual(
+                        client.put(tag_url, json={"tag_ids": bad_ids}, headers=headers).status_code,
+                        400,
+                    )
+                self.assertEqual(client.put(tag_url, json={}, headers=headers).status_code, 400)
+                self.assertEqual(client.get(url, headers=headers).json()["tags"], [])
+                self.assertEqual(
+                    client.put(f"/apps/bot/api/transcripts/{other_id}/tags",
+                               json={"tag_ids": [work.id]}, headers=headers).status_code,
+                    404,
+                )
+                saved = client.put(
+                    tag_url, json={"tag_ids": [work.id, travel.id]}, headers=headers
+                )
+                self.assertEqual(saved.status_code, 200)
+                self.assertEqual(saved.json()["tags"], ["travel", "work"])
+                self.assertEqual(saved.json()["tag_ids"], [travel.id, work.id])
+                self.assertEqual(saved.json()["text"], "My text")
+                usage = client.get("/apps/bot/api/tags", headers=headers).json()["tags"]
+                self.assertEqual({tag["name"]: tag["usage_count"] for tag in usage},
+                                 {"travel": 1, "work": 1})
+                date_groups = client.get(
+                    "/apps/bot/api/groups?view=date&timezone=UTC", headers=headers
+                ).json()["groups"]
+                self.assertEqual(date_groups[0]["items"][0]["tags"], ["travel", "work"])
+                tag_groups = client.get(
+                    "/apps/bot/api/groups?view=tags&timezone=UTC", headers=headers
+                ).json()["groups"]
+                self.assertEqual(tag_groups[0]["items"][0]["id"], own_id)
+                cleared = client.put(tag_url, json={"tag_ids": []}, headers=headers)
+                self.assertEqual(cleared.json()["tags"], [])
+                self.assertEqual(cleared.json()["tag_ids"], [])
+                tag_groups = client.get(
+                    "/apps/bot/api/groups?view=tags&timezone=UTC", headers=headers
+                ).json()["groups"]
+                self.assertTrue(tag_groups[0]["untagged"])
+                self.assertEqual(tag_groups[0]["items"][0]["id"], own_id)
 
 
 if __name__ == "__main__":

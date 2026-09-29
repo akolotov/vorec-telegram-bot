@@ -47,9 +47,23 @@
       <article id="detail" hidden>
         <p id="detail-date" class="detail-date"></p>
         <h1 id="detail-title"></h1>
-        <div id="detail-tags" class="tags"></div>
+        <div class="detail-tags-row">
+          <div id="detail-tags" class="tags"></div>
+          <button id="edit-detail-tags" class="secondary-button" type="button">Edit tags</button>
+        </div>
         <div id="detail-text" class="detail-text"></div>
       </article>
+    </section>
+    <section id="tag-picker-screen" hidden>
+      <form id="tag-picker-form">
+        <div class="tag-picker-actions">
+          <button id="tag-picker-apply" class="primary-button" type="submit" disabled>Apply</button>
+          <button id="tag-picker-cancel" class="secondary-button" type="button">Cancel</button>
+        </div>
+        <h1>Edit tags</h1>
+        <div id="tag-picker-status" class="settings-status" role="status"></div>
+        <div id="tag-picker-list"></div>
+      </form>
     </section>
   </main>
 </body>

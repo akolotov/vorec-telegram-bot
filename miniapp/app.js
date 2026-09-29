@@ -10,6 +10,11 @@
   });
   const listScreen = document.getElementById("list-screen");
   const detailScreen = document.getElementById("detail-screen");
+  const tagPickerScreen = document.getElementById("tag-picker-screen");
+  const tagPickerList = document.getElementById("tag-picker-list");
+  const tagPickerStatus = document.getElementById("tag-picker-status");
+  const tagPickerApply = document.getElementById("tag-picker-apply");
+  const tagPickerCancel = document.getElementById("tag-picker-cancel");
   const settingsScreen = document.getElementById("settings-screen");
   const settingsStatus = document.getElementById("settings-status");
   const tagList = document.getElementById("tag-list");
@@ -24,6 +29,12 @@
   let tagRequestNumber = 0;
   let settingsSession = 0;
   let currentDetailId = null;
+  let currentDetailTagIds = [];
+  let detailDirty = false;
+  let pickerRequestNumber = 0;
+  let pickerLoaded = false;
+  let savePending = false;
+  let saveUncertain = false;
   let listAnchor = null;
   let currentTags = [];
   let editingTagId = null;
@@ -63,14 +74,23 @@
   }
 
   async function api(path, options = {}) {
-    const response = await fetch(new URL(path, base), {
-      ...options,
-      headers: {"X-Telegram-Init-Data": initData, ...options.headers},
-      cache: "no-store",
-    });
+    let response;
+    try {
+      response = await fetch(new URL(path, base), {
+        ...options,
+        headers: {"X-Telegram-Init-Data": initData, ...options.headers},
+        cache: "no-store",
+      });
+    } catch (_) {
+      throw new Error("Network error. Please try again.");
+    }
     if (response.status === 401) throw new Error("Сессия завершилась. Откройте приложение снова из меню бота.");
     if (response.status === 409) throw new Error("A category with this name already exists.");
-    if (response.status === 404) throw new Error("Category not found. Refresh the list.");
+    if (response.status === 404) throw new Error(
+      path.startsWith("api/transcripts/")
+        ? "Memo not found. Refresh the list."
+        : "Category not found. Refresh the list."
+    );
     if (response.status === 400) {
       const result = await response.json();
       throw new Error(result.error || "Invalid category details.");
@@ -115,45 +135,65 @@
     });
   }
 
-  async function loadList() {
+  function restoreListAnchor(anchor, request) {
+    requestAnimationFrame(() => {
+      if (listScreen.hidden || request !== requestNumber) return;
+      const button = groupsElement.querySelector(`[data-transcript-id="${anchor.id}"]`);
+      if (button) {
+        window.scrollTo(0, window.scrollY + button.getBoundingClientRect().top - anchor.top);
+      } else {
+        window.scrollTo(0, 0);
+      }
+    });
+  }
+
+  async function loadList(anchor = null) {
     const request = ++requestNumber;
     groupsElement.replaceChildren();
     listStatus.textContent = "Загрузка…";
     try {
       const params = new URLSearchParams({view: currentView, timezone});
       const result = await api(`api/groups?${params}`);
-      if (request === requestNumber) renderGroups(result.groups);
+      if (request === requestNumber) {
+        renderGroups(result.groups);
+        if (anchor) restoreListAnchor(anchor, request);
+      }
     } catch (error) {
-      if (request === requestNumber) showError(listStatus, error.message, loadList);
+      if (request === requestNumber) {
+        showError(listStatus, error.message, () => loadList(anchor));
+      }
     }
   }
 
   function showList() {
+    if (savePending) return;
     ++requestNumber;
     ++tagRequestNumber;
     ++settingsSession;
     const returningFromDetail = !detailScreen.hidden;
+    ++pickerRequestNumber;
     detailScreen.hidden = true;
+    tagPickerScreen.hidden = true;
     const returningFromSettings = !settingsScreen.hidden;
     settingsScreen.hidden = true;
     listScreen.hidden = false;
     webApp?.BackButton?.hide();
-    if (returningFromDetail && listAnchor) {
-      const anchor = listAnchor;
-      const restoreRequest = requestNumber;
-      requestAnimationFrame(() => {
-        if (listScreen.hidden || restoreRequest !== requestNumber) return;
-        const button = groupsElement.querySelector(`[data-transcript-id="${anchor.id}"]`);
-        if (button) {
-          window.scrollTo(0, window.scrollY + button.getBoundingClientRect().top - anchor.top);
-        } else {
-          window.scrollTo(0, 0);
-        }
-      });
-    } else {
-      window.scrollTo(0, 0);
-    }
-    if (returningFromSettings) loadList();
+    const anchor = returningFromDetail ? listAnchor : null;
+    const refresh = returningFromSettings || (returningFromDetail && detailDirty);
+    detailDirty = false;
+    if (refresh) loadList(anchor);
+    else if (anchor) restoreListAnchor(anchor, requestNumber);
+    else window.scrollTo(0, 0);
+  }
+
+  function renderDetail(item) {
+    currentDetailTagIds = item.tag_ids;
+    document.getElementById("detail-date").textContent = formatInstant(item.created_at);
+    document.getElementById("detail-title").textContent = item.title;
+    document.getElementById("detail-tags").replaceWith(makeDetailTags(item.tags));
+    document.getElementById("detail-text").textContent = item.text;
+    detailStatus.textContent = "";
+    detailElement.hidden = false;
   }
 
   async function openDetail(id) {
@@ -169,12 +209,7 @@
     try {
       const item = await api(`api/transcripts/${id}`);
       if (request !== requestNumber) return;
-      document.getElementById("detail-date").textContent = formatInstant(item.created_at);
-      document.getElementById("detail-title").textContent = item.title;
-      document.getElementById("detail-tags").replaceWith(makeDetailTags(item.tags));
-      document.getElementById("detail-text").textContent = item.text;
-      detailStatus.textContent = "";
-      detailElement.hidden = false;
+      renderDetail(item);
     } catch (error) {
       if (request === requestNumber) showError(detailStatus, error.message, () => openDetail(id));
     }
@@ -184,6 +219,125 @@
     const tags = makeTags(names);
     tags.id = "detail-tags";
     return tags;
+  }
+
+  function setPickerBusy(busy) {
+    tagPickerApply.disabled = busy || !pickerLoaded;
+    tagPickerCancel.disabled = busy;
+    tagPickerList.querySelectorAll("input").forEach((input) => { input.disabled = busy; });
+    if (!tagPickerScreen.hidden) {
+      if (busy) webApp?.BackButton?.hide();
+      else webApp?.BackButton?.show();
+    }
+  }
+
+  async function loadPickerTags() {
+    const request = ++pickerRequestNumber;
+    pickerLoaded = false;
+    tagPickerApply.disabled = true;
+    tagPickerList.replaceChildren();
+    tagPickerStatus.textContent = "Loading…";
+    try {
+      const result = await api("api/tags");
+      if (request !== pickerRequestNumber || tagPickerScreen.hidden) return;
+      const tags = result.tags.sort((a, b) =>
+        b.usage_count - a.usage_count || a.name.localeCompare(b.name) || a.id - b.id
+      );
+      tags.forEach((tag) => {
+        const row = document.createElement("label");
+        row.className = "tag-picker-row";
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.value = String(tag.id);
+        checkbox.checked = currentDetailTagIds.includes(tag.id);
+        const name = document.createElement("span");
+        name.textContent = `#${tag.name}`;
+        row.append(checkbox, name);
+        tagPickerList.append(row);
+      });
+      if (!tags.length) tagPickerStatus.textContent = "No categories yet.";
+      else tagPickerStatus.textContent = "";
+      pickerLoaded = true;
+      setPickerBusy(false);
+    } catch (error) {
+      if (request === pickerRequestNumber && !tagPickerScreen.hidden) {
+        showError(tagPickerStatus, error.message, loadPickerTags);
+      }
+    }
+  }
+
+  function openTagPicker() {
+    detailScreen.hidden = true;
+    tagPickerScreen.hidden = false;
+    tagPickerCancel.disabled = false;
+    saveUncertain = false;
+    webApp?.BackButton?.show();
+    window.scrollTo(0, 0);
+    loadPickerTags();
+  }
+
+  function returnToDetail() {
+    ++pickerRequestNumber;
+    tagPickerScreen.hidden = true;
+    detailScreen.hidden = false;
+    webApp?.BackButton?.show();
+    window.scrollTo(0, 0);
+  }
+
+  async function cancelTagPicker() {
+    if (savePending || tagPickerScreen.hidden) return;
+    if (!saveUncertain) {
+      returnToDetail();
+      return;
+    }
+    savePending = true;
+    setPickerBusy(true);
+    tagPickerStatus.textContent = "Checking saved tags…";
+    try {
+      const item = await api(`api/transcripts/${currentDetailId}`);
+      renderDetail(item);
+      detailDirty = true;
+      saveUncertain = false;
+      returnToDetail();
+    } catch (_) {
+      tagPickerStatus.textContent = "Could not confirm saved tags. Try Cancel again when connected.";
+    } finally {
+      savePending = false;
+      setPickerBusy(false);
+    }
+  }
+
+  async function applyTagPicker(event) {
+    event.preventDefault();
+    if (savePending || !pickerLoaded || tagPickerScreen.hidden) return;
+    const tagIds = [...tagPickerList.querySelectorAll("input:checked")]
+      .map((input) => Number(input.value));
+    if (!saveUncertain && tagIds.length === currentDetailTagIds.length
+        && tagIds.every((id) => currentDetailTagIds.includes(id))) {
+      returnToDetail();
+      return;
+    }
+    savePending = true;
+    setPickerBusy(true);
+    tagPickerStatus.textContent = "Saving…";
+    try {
+      const item = await api(`api/transcripts/${currentDetailId}/tags`, {
+        method: "PUT",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({tag_ids: tagIds}),
+      });
+      renderDetail(item);
+      detailDirty = true;
+      saveUncertain = false;
+      returnToDetail();
+    } catch (error) {
+      saveUncertain = true;
+      detailDirty = true;
+      tagPickerStatus.textContent = `${error.message} Retry Apply or Cancel to check saved tags.`;
+    } finally {
+      savePending = false;
+      setPickerBusy(false);
+    }
   }
 
   function makeIconButton(kind, label) {
@@ -401,7 +555,14 @@
     document.getElementById("editing-tag-name").focus({preventScroll: true});
   });
   document.getElementById("back-button").addEventListener("click", showList);
-  webApp?.BackButton?.onClick(() => showList());
+  document.getElementById("edit-detail-tags").addEventListener("click", openTagPicker);
+  document.getElementById("tag-picker-form").addEventListener("submit", applyTagPicker);
+  tagPickerCancel.addEventListener("click", cancelTagPicker);
+  webApp?.BackButton?.onClick(() => {
+    if (savePending) return;
+    if (!tagPickerScreen.hidden) cancelTagPicker();
+    else showList();
+  });
   if (!initData) {
     showError(listStatus, "Откройте приложение через меню бота в Telegram.");
     return;

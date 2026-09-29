@@ -38,7 +38,11 @@ def transcript_item(
 
 
 def transcript_detail(record: TranscriptDetail) -> dict[str, object]:
-    return {**transcript_item(record), "text": record.text}
+    return {
+        **transcript_item(record),
+        "tag_ids": [tag.id for tag in record.tags],
+        "text": record.text,
+    }
 
 
 def group_by_date(
