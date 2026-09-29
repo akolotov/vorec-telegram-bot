@@ -190,7 +190,43 @@ Then repeat the command without `--dry-run` to create or update `data/vorec.sqli
 user and chat IDs apply to the whole archive. For current recording names, the importer verifies
 that the embedded chat ID matches. Legacy rows have no Telegram message ID. Audio files without a
 completed transcript directory are reported and ignored. When `title.txt` is absent, the importer
-uses the first 50 characters of the merged transcript as its title.
+uses the first 50 characters of the merged transcript as its title. This phase does not
+call the inference provider or change tag assignments. `--dry-run` only validates the archive.
+
+### Importing the default tags
+
+The initial tag catalog is bundled in `vorec/default_tags.json`. Stop the bot before
+writing to its database, then run this command against the **existing** production
+database from a checkout with the project `.venv`:
+
+```sh
+.venv/bin/python -m vorec.import_tags \
+  --database /path/to/production/data/vorec.sqlite3 \
+  --user-id <telegram-user-id>
+```
+
+The command imports all default tags for that user in one transaction. It refuses a
+missing database, any existing tags, or a user ID that does not match existing
+transcripts. It does not assign tags to older transcripts. To change the base catalog
+for a future deployment, edit `vorec/default_tags.json` before running the command.
+
+### Regenerating titles and tags
+
+After importing transcripts and setting up the tag catalog, run the second phase separately:
+
+```sh
+.venv/bin/python -m vorec.import_transcripts \
+  --data-directory data \
+  --regenerate-titles-and-tags
+```
+
+By default, this phase reads every transcript already in the database, including rows from earlier
+imports. To regenerate only specific database records, add `--transcript-ids 6 13 23` (with the
+desired IDs). It uses the primary inference provider and `TITLE_MODEL` from `.env` to replace titles
+and tag assignments for those records. It does not read the filesystem archive and does not need
+user or chat IDs. If inference fails for a transcript, the command keeps its current title, clears
+its tags, continues, and reports the failure count while exiting with status 0. Stop the bot before
+writing to the database.
 
 ## Management
 

@@ -352,6 +352,23 @@ class TranscriptStore:
             raise TranscriptStorageError("Could not read personal tags.") from error
         return tuple(TagDefinition(*row) for row in rows)
 
+    def list_all_records(self) -> list[TranscriptRecord]:
+        """Read every complete transcript for archive metadata regeneration."""
+        return [record for _, record in self.list_all_records_with_ids()]
+
+    def list_all_records_with_ids(self) -> list[tuple[int, TranscriptRecord]]:
+        """Read transcript IDs and records in database order."""
+        try:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    """SELECT id, telegram_user_id, telegram_chat_id, telegram_message_id,
+                              created_at, title, text, source_audio_path, artifacts_dir
+                       FROM transcripts ORDER BY id"""
+                ).fetchall()
+        except (OSError, sqlite3.Error) as error:
+            raise TranscriptStorageError("Could not read transcripts.") from error
+        return [(row[0], TranscriptRecord(*row[1:])) for row in rows]
+
     def list_for_user(self, telegram_user_id: int) -> list[TranscriptSummary]:
         """Read a user's transcript metadata and personal tags in one query."""
         try:

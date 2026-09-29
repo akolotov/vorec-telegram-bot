@@ -366,6 +366,10 @@ class TranscriptTitleTests(unittest.TestCase):
         self.assertIn("5-10 words", request["messages"][0]["content"])
         self.assertIn("same broad topic", request["messages"][0]["content"])
         self.assertIn(
+            "respecting conditions and exclusions in tag descriptions",
+            request["messages"][0]["content"],
+        )
+        self.assertIn(
             "<TRANSCRIPT>\nFull transcript\n</TRANSCRIPT>",
             request["messages"][0]["content"],
         )

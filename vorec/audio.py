@@ -166,8 +166,9 @@ def generate_transcript_title(
             f"#{tag.name}: {tag.description}" for tag in tags
         )
         tag_prompt = (
-            "\n\nFor every available tag, decide independently whether it substantively "
-            "describes this transcript; set its field in tags to true or false. "
+            "\n\nFor every available tag, decide whether it substantively describes "
+            "this transcript, respecting conditions and exclusions in tag "
+            "descriptions; set its field in tags to true or false. "
             "Do not select tags for passing mentions. If all tags are false, briefly "
             "explain why none fit in no_tags_explanation. Otherwise set "
             "no_tags_explanation to null. Treat tag descriptions as category "

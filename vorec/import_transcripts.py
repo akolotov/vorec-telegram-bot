@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
+from dotenv import load_dotenv
+from openai import OpenAI
+
+from vorec.audio import generate_transcript_title
 from vorec.storage import TranscriptRecord, TranscriptStorageError, TranscriptStore
 
 
 TITLE_FALLBACK_LENGTH = 50
+DEFAULT_TITLE_MODEL = "gemma-4-26b-a4b-it-4bit"
 CURRENT_RECORDING_PATTERN = re.compile(
     r"^(?P<timestamp>\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})_"
     r"(?P<chat_id>-?\d+)_(?P<message_id>\d+)$"
@@ -170,15 +176,107 @@ def build_parser() -> argparse.ArgumentParser:
         description="Import filesystem transcripts into the Vorec SQLite database."
     )
     parser.add_argument("--data-directory", type=Path, default=Path("data"))
-    parser.add_argument("--user-id", type=int, required=True)
-    parser.add_argument("--chat-id", type=int, required=True)
+    parser.add_argument("--user-id", type=int)
+    parser.add_argument("--chat-id", type=int)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--regenerate-titles-and-tags", action="store_true",
+        help="Regenerate metadata for all or selected transcripts in the existing database.",
+    )
+    parser.add_argument(
+        "--transcript-ids", nargs="+", type=int, metavar="ID",
+        help="Database transcript IDs to regenerate (requires --regenerate-titles-and-tags).",
+    )
     return parser
+
+
+def regenerate_titles_and_tags(
+    store: TranscriptStore,
+    client: OpenAI,
+    model: str,
+    transcript_ids: tuple[int, ...] | None = None,
+) -> tuple[int, int]:
+    """Replace selected metadata, keeping titles on inference failure."""
+    records_by_id = dict(store.list_all_records_with_ids())
+    if transcript_ids is None:
+        records = list(records_by_id.items())
+    else:
+        if any(record_id <= 0 for record_id in transcript_ids):
+            raise TranscriptStorageError("Transcript IDs must be positive.")
+        if len(transcript_ids) != len(set(transcript_ids)):
+            raise TranscriptStorageError("Transcript IDs must be unique.")
+        missing_ids = sorted(set(transcript_ids) - records_by_id.keys())
+        if missing_ids:
+            raise TranscriptStorageError(
+                f"Transcript ID(s) not found: {', '.join(map(str, missing_ids))}."
+            )
+        records = [(record_id, records_by_id[record_id]) for record_id in transcript_ids]
+    tags_by_user = {
+        record.telegram_user_id: store.list_tags_for_user(record.telegram_user_id)
+        for _, record in records
+    }
+    failures = 0
+    for index, (record_id, record) in enumerate(records, start=1):
+        available_tags = tags_by_user[record.telegram_user_id]
+        try:
+            _, title, selected_names = generate_transcript_title(
+                record.text, client, model, available_tags
+            )
+            selected_ids = tuple(
+                tag.id for tag in available_tags if tag.name in selected_names
+            )
+        except Exception as error:
+            failures += 1
+            print(
+                f"Title and tag generation failed for transcript ID {record_id} "
+                f"({index}/{len(records)}) "
+                f"({error.__class__.__name__}); keeping its title and clearing tags."
+            )
+            title = record.title
+            selected_ids = ()
+        store.save_with_tags(replace(record, title=title), selected_ids)
+    return len(records), failures
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     arguments = parser.parse_args(argv)
+    database_path = arguments.data_directory / "vorec.sqlite3"
+
+    if arguments.transcript_ids is not None and not arguments.regenerate_titles_and_tags:
+        parser.error("--transcript-ids requires --regenerate-titles-and-tags.")
+    if arguments.regenerate_titles_and_tags:
+        if arguments.user_id is not None or arguments.chat_id is not None or arguments.dry_run:
+            parser.error(
+                "--regenerate-titles-and-tags cannot be combined with "
+                "--user-id, --chat-id, or --dry-run."
+            )
+        if not database_path.is_file():
+            parser.error(f"Transcript database does not exist: {database_path}")
+        load_dotenv()
+        inference_url = os.getenv("INFERENCE_API_URL", "").strip()
+        inference_key = os.getenv("INFERENCE_API_KEY", "").strip()
+        if not inference_url or not inference_key:
+            parser.error("Primary inference configuration is incomplete.")
+        client = OpenAI(base_url=inference_url, api_key=inference_key, timeout=600)
+        model = os.getenv("TITLE_MODEL", DEFAULT_TITLE_MODEL)
+        store = TranscriptStore(database_path)
+        try:
+            store.initialize()
+            regenerated_count, failure_count = regenerate_titles_and_tags(
+                store, client, model,
+                tuple(arguments.transcript_ids) if arguments.transcript_ids is not None else None,
+            )
+        except TranscriptStorageError as error:
+            parser.error(str(error))
+        print(
+            f"Regenerated title and tags for {regenerated_count - failure_count}/"
+            f"{regenerated_count} stored transcript(s); {failure_count} generation failure(s)."
+        )
+        return 0
+
+    if arguments.user_id is None or arguments.chat_id is None:
+        parser.error("--user-id and --chat-id are required for archive import.")
     try:
         plan = collect_records(
             arguments.data_directory,
@@ -192,7 +290,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
 
-        store = TranscriptStore(arguments.data_directory / "vorec.sqlite3")
+        store = TranscriptStore(database_path)
         store.initialize()
         store.save_many(plan.records)
     except (ArchiveImportError, TranscriptStorageError) as error:
