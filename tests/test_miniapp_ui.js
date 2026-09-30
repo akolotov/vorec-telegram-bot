@@ -88,6 +88,9 @@ test("Tag picker blocks navigation during save and handles failed saves", async 
   const registry = {};
   const ids = [
     "list-screen", "detail-screen", "settings-screen", "tag-picker-screen",
+    "title-editor-screen", "title-editor-input", "title-editor-status",
+    "title-editor-apply", "title-editor-cancel", "title-editor-generate",
+    "title-editor-form", "edit-detail-title",
     "settings-status", "tag-list", "add-tag-button", "groups", "list-status",
     "detail-status", "detail", "date-tab", "tags-tab", "detail-date",
     "detail-title", "detail-tags", "detail-text", "tag-picker-list",
@@ -101,6 +104,7 @@ test("Tag picker blocks navigation during save and handles failed saves", async 
   registry["detail-screen"].hidden = true;
   registry["settings-screen"].hidden = true;
   registry["tag-picker-screen"].hidden = true;
+  registry["title-editor-screen"].hidden = true;
   let telegramBack;
   let backVisible = false;
   let groupReads = 0;
@@ -223,10 +227,187 @@ test("Tag picker blocks navigation during save and handles failed saves", async 
   assert.equal(registry["detail-screen"].hidden, false);
 });
 
+test("Title editor previews AI titles, saves on Apply, and resolves uncertain saves", async () => {
+  const registry = {};
+  const ids = [
+    "list-screen", "detail-screen", "settings-screen", "tag-picker-screen",
+    "title-editor-screen", "title-editor-input", "title-editor-status",
+    "title-editor-apply", "title-editor-cancel", "title-editor-generate",
+    "title-editor-form", "edit-detail-title", "settings-status", "tag-list",
+    "add-tag-button", "groups", "list-status", "detail-status", "detail",
+    "refresh-button",
+    "date-tab", "tags-tab", "detail-date", "detail-title", "detail-tags",
+    "detail-text", "tag-picker-list", "tag-picker-status", "tag-picker-apply",
+    "tag-picker-cancel", "tag-picker-form", "settings-button",
+    "settings-back-button", "back-button", "edit-detail-tags",
+  ];
+  ids.forEach((id) => { new Element("div", registry).id = id; });
+  registry["detail-tags"].parent = new Element("div", registry);
+  registry["detail-tags"].parent.append(registry["detail-tags"]);
+  for (const id of ["detail-screen", "settings-screen", "tag-picker-screen", "title-editor-screen"]) {
+    registry[id].hidden = true;
+  }
+  let memo = {
+    id: 1, created_at: "2026-09-24T10:00:00+00:00", title: "Old title",
+    text: "Text", tags: ["work"], tag_ids: [1],
+  };
+  let telegramBack;
+  let backVisible = false;
+  let groupReads = 0;
+  let puts = 0;
+  let finishGeneration;
+  let deferGeneration = false;
+  let failGeneration = false;
+  let finishPut;
+  let deferPut = false;
+  let failPutAfterSave = false;
+  const window = {
+    location: {href: "https://example.test/apps/bot/"},
+    scrollY: 0,
+    scrollTo(_x, y) { this.scrollY = y; },
+    Telegram: {WebApp: {
+      initData: "signed-data", ready() {}, expand() {},
+      BackButton: {
+        onClick(callback) { telegramBack = callback; },
+        hide() { backVisible = false; },
+        show() { backVisible = true; },
+      },
+    }},
+  };
+  const document = {
+    getElementById: (id) => registry[id],
+    createElement: (tag) => new Element(tag, registry),
+    createTextNode: (value) => new Element(value, registry),
+  };
+  const fetch = async (url, options) => {
+    if (url.pathname.endsWith("/api/groups")) {
+      groupReads++;
+      return response({groups: [{key: "2026-09-24", items: [{
+        id: 1, title: memo.title, tags: memo.tags,
+      }]}]});
+    }
+    if (url.pathname.endsWith("/api/transcripts/1/generate-title")) {
+      assert.equal(options.method, "POST");
+      if (failGeneration) throw new Error("Offline");
+      if (deferGeneration) {
+        return new Promise((resolve) => {
+          finishGeneration = () => resolve(response({title: "Late AI title"}));
+        });
+      }
+      return response({title: "AI suggestion"});
+    }
+    if (url.pathname.endsWith("/api/transcripts/1/title") && options.method === "PUT") {
+      puts++;
+      const title = JSON.parse(options.body).title;
+      if (failPutAfterSave) {
+        failPutAfterSave = false;
+        memo = {...memo, title};
+        throw new Error("Connection lost");
+      }
+      if (deferPut) {
+        return new Promise((resolve) => {
+          finishPut = () => {
+            memo = {...memo, title};
+            resolve(response(memo));
+          };
+        });
+      }
+      memo = {...memo, title};
+      return response(memo);
+    }
+    if (url.pathname.endsWith("/api/transcripts/1")) return response(memo);
+    throw new Error(`Unexpected request: ${url}`);
+  };
+  const source = fs.readFileSync(path.join(__dirname, "../miniapp/app.js"), "utf8");
+  vm.runInNewContext(source, {
+    document, window, fetch, URL, URLSearchParams, Intl,
+    requestAnimationFrame: (callback) => callback(),
+  });
+  await flush();
+  const initialButton = registry.groups.querySelector('[data-transcript-id="1"]');
+  initialButton.getBoundingClientRect = () => ({top: 42});
+  await initialButton.dispatch("click");
+  await flush();
+
+  await registry["edit-detail-title"].dispatch("click");
+  assert.equal(registry["title-editor-input"].value, "Old title");
+  registry["title-editor-input"].value = "Manual draft";
+  await registry["title-editor-cancel"].dispatch("click");
+  assert.equal(registry["detail-title"].textContent, "Old title");
+  assert.equal(puts, 0);
+
+  await registry["edit-detail-title"].dispatch("click");
+  deferGeneration = true;
+  const lateGeneration = registry["title-editor-generate"].dispatch("click");
+  await flush();
+  assert.equal(registry["title-editor-apply"].disabled, true);
+  assert.equal(registry["title-editor-generate"].disabled, true);
+  assert.equal(registry["title-editor-cancel"].disabled, false);
+  await registry["title-editor-cancel"].dispatch("click");
+  await registry["edit-detail-title"].dispatch("click");
+  registry["title-editor-input"].value = "Another draft";
+  finishGeneration();
+  await lateGeneration;
+  assert.equal(registry["title-editor-input"].value, "Another draft");
+
+  deferGeneration = false;
+  failGeneration = true;
+  await registry["title-editor-generate"].dispatch("click");
+  assert.equal(registry["title-editor-input"].value, "Another draft");
+  assert.equal(registry["title-editor-input"].disabled, false);
+  failGeneration = false;
+  await registry["title-editor-generate"].dispatch("click");
+  assert.equal(registry["title-editor-input"].value, "AI suggestion");
+  registry["title-editor-input"].value = "Edited AI title";
+  deferPut = true;
+  const saving = registry["title-editor-form"].dispatch("submit");
+  await registry["title-editor-cancel"].dispatch("click");
+  telegramBack();
+  await registry["title-editor-form"].dispatch("submit");
+  assert.equal(puts, 1);
+  assert.equal(registry["title-editor-screen"].hidden, false);
+  assert.equal(registry["title-editor-cancel"].disabled, true);
+  assert.equal(backVisible, false);
+  finishPut();
+  await saving;
+  assert.equal(registry["detail-title"].textContent, "Edited AI title");
+  telegramBack();
+  await flush();
+  assert.equal(groupReads, 2);
+  assert.equal(registry.groups.querySelector('[data-transcript-id="1"]').children[0].textContent,
+               "Edited AI title");
+  assert.equal(window.scrollY, 58);
+
+  await registry.groups.querySelector('[data-transcript-id="1"]').dispatch("click");
+  await flush();
+  await registry["edit-detail-title"].dispatch("click");
+  await registry["title-editor-generate"].dispatch("click");
+  await registry["title-editor-cancel"].dispatch("click");
+  assert.equal(registry["detail-title"].textContent, "Edited AI title");
+
+  await registry["edit-detail-title"].dispatch("click");
+  registry["title-editor-input"].value = "Saved despite error";
+  deferPut = false;
+  failPutAfterSave = true;
+  await registry["title-editor-form"].dispatch("submit");
+  assert.equal(registry["title-editor-screen"].hidden, false);
+  assert.match(registry["title-editor-status"].textContent, /Retry Apply or Cancel/);
+  await registry["title-editor-cancel"].dispatch("click");
+  assert.equal(registry["detail-title"].textContent, "Saved despite error");
+  telegramBack();
+  await flush();
+  assert.equal(groupReads, 3);
+  assert.equal(registry.groups.querySelector('[data-transcript-id="1"]').children[0].textContent,
+               "Saved despite error");
+});
+
 test("Refresh reloads the current view at the top and preserves detail return position", async () => {
   const registry = {};
   const ids = [
     "list-screen", "detail-screen", "settings-screen", "tag-picker-screen",
+    "title-editor-screen", "title-editor-input", "title-editor-status",
+    "title-editor-apply", "title-editor-cancel", "title-editor-generate",
+    "title-editor-form", "edit-detail-title",
     "settings-status", "tag-list", "add-tag-button", "groups", "list-status",
     "detail-status", "detail", "date-tab", "tags-tab", "detail-date",
     "detail-title", "detail-tags", "detail-text", "tag-picker-list",
@@ -240,6 +421,7 @@ test("Refresh reloads the current view at the top and preserves detail return po
   registry["detail-screen"].hidden = true;
   registry["settings-screen"].hidden = true;
   registry["tag-picker-screen"].hidden = true;
+  registry["title-editor-screen"].hidden = true;
   const window = {
     location: {href: "https://example.test/apps/bot/"},
     scrollY: 0,

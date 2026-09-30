@@ -173,6 +173,7 @@ class MiniAppWebTests(unittest.TestCase):
             allowed_user_ids={101},
             transcript_store=Mock(),
             configure_menu_buttons=AsyncMock(),
+            suggest_title=AsyncMock(),
         )
         with self.assertRaisesRegex(RuntimeError, "registration failed"):
             with TestClient(web):
@@ -210,6 +211,7 @@ class MiniAppWebTests(unittest.TestCase):
                 allowed_user_ids={101},
                 transcript_store=store,
                 configure_menu_buttons=configure_menu,
+                suggest_title=AsyncMock(),
             )
             init_data = signed_data([("auth_date", str(int(time.time()))), ("user", '{"id":101}')])
             headers = {"X-Telegram-Init-Data": init_data}
@@ -301,6 +303,7 @@ class MiniAppWebTests(unittest.TestCase):
                 allowed_user_ids={101},
                 transcript_store=store,
                 configure_menu_buttons=AsyncMock(),
+                suggest_title=AsyncMock(),
             )
             headers = {"X-Telegram-Init-Data": signed_data([
                 ("auth_date", str(int(time.time()))), ("user", '{"id":101}'),
@@ -348,6 +351,81 @@ class MiniAppWebTests(unittest.TestCase):
                 ).json()["groups"]
                 self.assertTrue(tag_groups[0]["untagged"])
                 self.assertEqual(tag_groups[0]["items"][0]["id"], own_id)
+
+    def test_title_suggestion_is_preview_and_title_update_preserves_tags(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = TranscriptStore(Path(directory) / "database.sqlite3")
+            store.initialize()
+            store.save(TranscriptRecord(
+                101, 101, 1, "2026-09-24T10:00:00+00:00", "Old title", "Own text",
+                "voices/own.ogg", "transcripts/own",
+            ))
+            store.save(TranscriptRecord(
+                202, 202, 2, "2026-09-24T11:00:00+00:00", "Other title", "Other text",
+                "voices/other.ogg", "transcripts/other",
+            ))
+            tag = store.create_tag(101, "work", "Work notes")
+            own_id = store.list_for_user(101)[0].id
+            other_id = store.list_for_user(202)[0].id
+            store.replace_tags_for_user(own_id, 101, (tag.id,))
+            suggest_title = AsyncMock(return_value="AI title")
+            web = create_web_application(
+                FakeApplication(),
+                webhook_path="/hooks/bot/telegram/webhook",
+                webhook_url="https://example.test/hooks/bot/telegram/webhook",
+                webhook_secret_token="webhook-secret",
+                app_path="/apps/bot/",
+                bot_token=TOKEN,
+                allowed_user_ids={101},
+                transcript_store=store,
+                configure_menu_buttons=AsyncMock(),
+                suggest_title=suggest_title,
+            )
+            headers = {"X-Telegram-Init-Data": signed_data([
+                ("auth_date", str(int(time.time()))), ("user", '{"id":101}'),
+            ])}
+            own_url = f"/apps/bot/api/transcripts/{own_id}"
+            with TestClient(web) as client:
+                self.assertEqual(client.post(own_url + "/generate-title").status_code, 401)
+                self.assertEqual(client.put(own_url + "/title", json={"title": "No"}).status_code, 401)
+                self.assertEqual(client.post(
+                    f"/apps/bot/api/transcripts/{other_id}/generate-title", headers=headers
+                ).status_code, 404)
+                self.assertEqual(client.post(
+                    "/apps/bot/api/transcripts/999999/generate-title", headers=headers
+                ).status_code, 404)
+                self.assertEqual(client.put(
+                    f"/apps/bot/api/transcripts/{other_id}/title",
+                    json={"title": "No"}, headers=headers,
+                ).status_code, 404)
+                suggest_title.assert_not_awaited()
+
+                suggestion = client.post(own_url + "/generate-title", headers=headers)
+                self.assertEqual(suggestion.status_code, 200)
+                self.assertEqual(suggestion.json(), {"title": "AI title"})
+                suggest_title.assert_awaited_once_with("Own text")
+                self.assertEqual(client.get(own_url, headers=headers).json()["title"], "Old title")
+
+                title_url = own_url + "/title"
+                self.assertEqual(client.put(title_url, content=b"{}", headers=headers).status_code, 415)
+                for body in ({}, {"title": 12}, {"title": "   "}):
+                    self.assertEqual(client.put(title_url, json=body, headers=headers).status_code, 400)
+                updated = client.put(title_url, json={"title": "  Manual title  "}, headers=headers)
+                self.assertEqual(updated.status_code, 200)
+                self.assertEqual(updated.json()["title"], "Manual title")
+                self.assertEqual(updated.json()["text"], "Own text")
+                self.assertEqual(updated.json()["tags"], ["work"])
+                self.assertEqual(updated.json()["tag_ids"], [tag.id])
+                self.assertEqual(store.get_for_user(other_id, 202).title, "Other title")
+                groups = client.get(
+                    "/apps/bot/api/groups?view=date&timezone=UTC", headers=headers
+                ).json()["groups"]
+                self.assertEqual(groups[0]["items"][0]["title"], "Manual title")
+                suggest_title.side_effect = RuntimeError("Provider details")
+                failure = client.post(own_url + "/generate-title", headers=headers)
+                self.assertEqual(failure.status_code, 502)
+                self.assertNotIn("Provider details", failure.text)
+                self.assertEqual(store.get_for_user(own_id, 101).title, "Manual title")
 
 
 if __name__ == "__main__":

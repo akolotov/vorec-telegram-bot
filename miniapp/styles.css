@@ -58,13 +58,19 @@ h1 { margin: 0 0 20px; font-size: 29px; line-height: 1.2; letter-spacing: -.02em
 .retry { margin-top: 12px; padding: 9px 15px; border: 0; border-radius: 10px; background: var(--accent); color: #fff; cursor: pointer; }
 .back-button { margin: 0 0 24px; padding: 0; border: 0; background: none; color: var(--accent); cursor: pointer; }
 .detail-date { margin: 0 0 8px; color: var(--muted); font-size: 13px; }
-#detail-title { margin-bottom: 10px; overflow-wrap: anywhere; }
+.detail-title-row { display: flex; align-items: flex-start; gap: 8px; }
+#detail-title { flex: 1; min-width: 0; margin-bottom: 10px; overflow-wrap: anywhere; }
 .detail-tags-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
 .detail-tags-row .tags { flex: 1; min-width: 0; }
 .detail-tags-row button { flex: none; padding: 6px 9px; border-radius: 9px; cursor: pointer; font-size: 13px; }
 .detail-text { margin-top: 26px; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.65; }
 .tag-picker-actions { display: flex; gap: 10px; margin-bottom: 24px; }
 .tag-picker-actions button { padding: 8px 13px; border-radius: 9px; cursor: pointer; }
+.title-editor-label { display: block; margin-bottom: 8px; font-weight: 600; font-size: 14px; }
+.title-editor-field { display: flex; align-items: center; gap: 8px; }
+.title-editor-field input { flex: 1; min-width: 0; padding: 10px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); color: var(--text); font: inherit; }
+.title-editor-field .icon-button { background: var(--surface); color: var(--accent); }
+#title-editor-status:not(:empty) { margin-top: 12px; }
 .tag-picker-row { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; padding: 13px 16px; border-radius: 13px; background: var(--surface); color: var(--accent); cursor: pointer; overflow-wrap: anywhere; }
 .tag-picker-row input { flex: none; width: 18px; height: 18px; margin: 0; accent-color: var(--accent); }
 .settings-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }

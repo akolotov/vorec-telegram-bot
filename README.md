@@ -1,8 +1,8 @@
 # Vorec Telegram Bot
 
 Telegram bot that transcribes allowed users' voice messages and audio files. Its
-read-only Telegram Mini App shows each user's completed transcripts by date or
-personal tag.
+Telegram Mini App shows each user's completed transcripts by date or personal tag
+and lets them edit titles and tags.
 
 ![An Apple Watch with the X-Large face and a single Voice Memos complication](.assets/apple-watch-v8-voice-memo-faces.png)
 
@@ -121,7 +121,9 @@ Telegram's light and dark themes.
 The browser sends Telegram's raw `initData` on each API request. The server
 checks its signature and one-hour lifetime, then accesses only rows owned by the
 signed Telegram user ID. Full transcript text is fetched only after opening a
-title. The Mini App does not edit transcripts.
+title. The Mini App can edit a memo's title or tags, while its transcript text
+remains read-only. The title editor can suggest a new title with AI; suggestions
+are saved only after pressing **Apply**.
 
 The HTTP server writes access logs for Mini App pages, assets, API requests,
 and Telegram webhooks. Each entry contains the client address seen by the

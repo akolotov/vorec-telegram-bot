@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import secrets
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from vorec.miniapp_auth import InvalidInitData, verify_init_data
 from vorec.storage import (
     TagConflictError,
     TagValidationError,
+    TitleValidationError,
     TranscriptStorageError,
     TranscriptStore,
 )
@@ -39,6 +41,7 @@ def create_web_application(
     allowed_user_ids: set[int],
     transcript_store: TranscriptStore,
     configure_menu_buttons,
+    suggest_title: Callable[[str], Awaitable[str]],
 ) -> Starlette:
     """Serve bot updates, a static Mini App, and its authenticated API."""
 
@@ -110,6 +113,58 @@ def create_web_application(
             record = transcript_store.get_for_user(transcript_id, user_id)
         except TranscriptStorageError:
             LOGGER.exception("Could not load transcript.")
+            return JSONResponse({"error": "Unavailable"}, status_code=500, headers=NO_STORE)
+        if record is None:
+            return JSONResponse({"error": "Not found"}, status_code=404, headers=NO_STORE)
+        return JSONResponse(transcript_detail(record), headers=NO_STORE)
+
+    async def generate_title(request: Request) -> Response:
+        user_id = authenticated_user(request)
+        if user_id is None:
+            return JSONResponse({"error": "Unauthorized"}, status_code=401, headers=NO_STORE)
+        transcript_id = request.path_params["transcript_id"]
+        try:
+            record = transcript_store.get_for_user(transcript_id, user_id)
+        except TranscriptStorageError:
+            LOGGER.exception("Could not load transcript for title generation.")
+            return JSONResponse({"error": "Unavailable"}, status_code=500, headers=NO_STORE)
+        if record is None:
+            return JSONResponse({"error": "Not found"}, status_code=404, headers=NO_STORE)
+        try:
+            title = await suggest_title(record.text)
+            if not isinstance(title, str) or not title.strip():
+                raise ValueError("Empty title suggestion")
+        except Exception as error:
+            LOGGER.warning(
+                "Could not generate transcript title (%s).", error.__class__.__name__
+            )
+            return JSONResponse({"error": "Title generation failed"}, status_code=502, headers=NO_STORE)
+        return JSONResponse({"title": title.strip()}, headers=NO_STORE)
+
+    async def update_title(request: Request) -> Response:
+        user_id = authenticated_user(request)
+        if user_id is None:
+            return JSONResponse({"error": "Unauthorized"}, status_code=401, headers=NO_STORE)
+        if request.headers.get("content-type", "").partition(";")[0] != "application/json":
+            return JSONResponse({"error": "Expected JSON"}, status_code=415, headers=NO_STORE)
+        try:
+            body = await request.json()
+        except ValueError:
+            return JSONResponse({"error": "Invalid JSON"}, status_code=400, headers=NO_STORE)
+        if not isinstance(body, dict) or not isinstance(body.get("title"), str):
+            return JSONResponse({"error": "A title is required"}, status_code=400, headers=NO_STORE)
+        transcript_id = request.path_params["transcript_id"]
+        try:
+            updated = transcript_store.update_title_for_user(
+                transcript_id, user_id, body["title"]
+            )
+            if not updated:
+                return JSONResponse({"error": "Not found"}, status_code=404, headers=NO_STORE)
+            record = transcript_store.get_for_user(transcript_id, user_id)
+        except TitleValidationError as error:
+            return JSONResponse({"error": str(error)}, status_code=400, headers=NO_STORE)
+        except TranscriptStorageError:
+            LOGGER.exception("Could not update transcript title.")
             return JSONResponse({"error": "Unavailable"}, status_code=500, headers=NO_STORE)
         if record is None:
             return JSONResponse({"error": "Not found"}, status_code=404, headers=NO_STORE)
@@ -251,6 +306,16 @@ def create_web_application(
             Route(app_path + "styles.css", stylesheet, methods=["GET"]),
             Route(app_path + "api/groups", groups, methods=["GET"]),
             Route(app_path + "api/transcripts/{transcript_id:int}", detail, methods=["GET"]),
+            Route(
+                app_path + "api/transcripts/{transcript_id:int}/generate-title",
+                generate_title,
+                methods=["POST"],
+            ),
+            Route(
+                app_path + "api/transcripts/{transcript_id:int}/title",
+                update_title,
+                methods=["PUT"],
+            ),
             Route(
                 app_path + "api/transcripts/{transcript_id:int}/tags",
                 update_transcript_tags,

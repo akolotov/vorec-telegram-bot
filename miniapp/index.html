@@ -53,13 +53,35 @@
       <div id="detail-status" class="status" role="status"></div>
       <article id="detail" hidden>
         <p id="detail-date" class="detail-date"></p>
-        <h1 id="detail-title"></h1>
+        <div class="detail-title-row">
+          <h1 id="detail-title"></h1>
+          <button id="edit-detail-title" class="icon-button" type="button" aria-label="Edit title" title="Edit title">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16.5 5a2.1 2.1 0 0 1 3 3L9 18.5l-4 1 1-4L16.5 5Z"/></svg>
+          </button>
+        </div>
         <div class="detail-tags-row">
           <div id="detail-tags" class="tags"></div>
           <button id="edit-detail-tags" class="secondary-button" type="button">Edit tags</button>
         </div>
         <div id="detail-text" class="detail-text"></div>
       </article>
+    </section>
+    <section id="title-editor-screen" hidden>
+      <form id="title-editor-form">
+        <div class="tag-picker-actions">
+          <button id="title-editor-apply" class="primary-button" type="submit">Apply</button>
+          <button id="title-editor-cancel" class="secondary-button" type="button">Cancel</button>
+        </div>
+        <h1>Edit title</h1>
+        <label class="title-editor-label" for="title-editor-input">Title</label>
+        <div class="title-editor-field">
+          <input id="title-editor-input" type="text" required autocomplete="off">
+          <button id="title-editor-generate" class="icon-button" type="button" aria-label="Regenerate title with AI" title="Regenerate title with AI">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 6.4M20 5v6h-6"/></svg>
+          </button>
+        </div>
+        <div id="title-editor-status" class="settings-status" role="status"></div>
+      </form>
     </section>
     <section id="tag-picker-screen" hidden>
       <form id="tag-picker-form">
