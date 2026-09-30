@@ -50,6 +50,7 @@
   let savePending = false;
   let saveUncertain = false;
   let listAnchor = null;
+  const expandedCategories = new Set();
   let currentTags = [];
   let editingTagId = null;
 
@@ -127,8 +128,17 @@
     return response.json();
   }
 
-  function renderGroups(groups) {
+  function renderGroups(groups, anchor = null) {
     groupsElement.replaceChildren();
+    if (currentView === "tags") {
+      const keys = new Set(groups.map((group) => group.key));
+      expandedCategories.forEach((key) => {
+        if (!keys.has(key)) expandedCategories.delete(key);
+      });
+      const anchorGroup = anchor && groups.find((group) =>
+        group.items.some((item) => item.id === anchor.id));
+      if (anchorGroup) expandedCategories.add(anchorGroup.key);
+    }
     if (!groups.length) {
       listStatus.textContent = "Заметок пока нет.";
       return;
@@ -143,6 +153,35 @@
         ? formatDay(group.key)
         : group.untagged ? "Uncategorized" : `#${group.tag}`;
       section.append(heading);
+      let itemsContainer = section;
+      if (currentView === "tags") {
+        section.classList.toggle("category-group", true);
+        section.dataset.groupKey = String(group.key);
+        itemsContainer = document.createElement("div");
+        const toggle = document.createElement("button");
+        toggle.type = "button";
+        toggle.className = "category-toggle";
+        const indicator = document.createElement("span");
+        indicator.className = "category-indicator";
+        indicator.setAttribute("aria-hidden", "true");
+        const name = document.createElement("span");
+        name.textContent = heading.textContent;
+        toggle.append(indicator, name);
+        const updateExpanded = () => {
+          const expanded = expandedCategories.has(group.key);
+          itemsContainer.hidden = !expanded;
+          toggle.setAttribute("aria-expanded", String(expanded));
+          indicator.textContent = expanded ? "▾" : "▸";
+        };
+        toggle.addEventListener("click", () => {
+          if (expandedCategories.has(group.key)) expandedCategories.delete(group.key);
+          else expandedCategories.add(group.key);
+          updateExpanded();
+        });
+        heading.replaceChildren(toggle);
+        section.append(itemsContainer);
+        updateExpanded();
+      }
       group.items.forEach((item) => {
         const button = document.createElement("button");
         button.type = "button";
@@ -153,10 +192,10 @@
         title.textContent = item.title;
         button.append(title, makeTags(item.tags));
         button.addEventListener("click", () => {
-          listAnchor = {id: item.id, top: button.getBoundingClientRect().top};
+          listAnchor = {id: item.id, groupKey: group.key, top: button.getBoundingClientRect().top};
           openDetail(item.id);
         });
-        section.append(button);
+        itemsContainer.append(button);
       });
       groupsElement.append(section);
     });
@@ -183,7 +222,7 @@
       const params = new URLSearchParams({view: currentView, timezone});
       const result = await api(`api/groups?${params}`);
       if (request === requestNumber) {
-        renderGroups(result.groups);
+        renderGroups(result.groups, anchor);
         if (anchor) restoreListAnchor(anchor, request);
       }
     } catch (error) {
@@ -753,6 +792,7 @@
 
   function setView(view) {
     if (view === currentView) return;
+    if (view === "tags") expandedCategories.clear();
     currentView = view;
     Object.entries(tabs).forEach(([name, button]) => {
       button.classList.toggle("active", name === view);
