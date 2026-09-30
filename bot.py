@@ -69,6 +69,9 @@ DELIVERY_UNCONFIRMED_TEXT = (
 )
 STORAGE_FAILED_TEXT = "The transcript was created, but it could not be saved."
 DELIVERY_RETRY_DELAYS = (1, 2)
+DOWNLOAD_RETRY_DELAYS = (1, 2)
+DOWNLOAD_READ_TIMEOUT = 30
+DOWNLOAD_FAILED_TEXT = "The audio could not be downloaded. Please try again."
 DEFAULT_WEBHOOK_LISTEN = "0.0.0.0"
 DEFAULT_WEBHOOK_PORT = 8080
 DATA_DIRECTORY = Path("data")
@@ -85,6 +88,41 @@ class ConfigurationError(ValueError):
 
 class TranscriptionError(RuntimeError):
     """A transcription failure with a user-safe English explanation."""
+
+
+class AudioDownloadError(TranscriptionError):
+    """A download failure that exposes only the original error's type."""
+
+    def __init__(self, error_type: str) -> None:
+        super().__init__(DOWNLOAD_FAILED_TEXT)
+        self.error_type = error_type
+
+
+async def download_audio(attachment, source: Path) -> None:
+    """Retry transient Telegram download failures without exposing request URLs."""
+    for attempt, delay in enumerate((*DOWNLOAD_RETRY_DELAYS, None), start=1):
+        try:
+            telegram_file = await attachment.get_file()
+            await telegram_file.download_to_drive(
+                custom_path=source, read_timeout=DOWNLOAD_READ_TIMEOUT
+            )
+            return
+        except Exception as error:
+            error_type = type(error).__name__
+            if (
+                delay is None
+                or not isinstance(error, NetworkError)
+                or isinstance(error, BadRequest)
+            ):
+                raise AudioDownloadError(error_type) from None
+            LOGGER.warning(
+                "Telegram audio download failed (%s); retrying in %d s (attempt %d/%d).",
+                error_type,
+                delay,
+                attempt + 1,
+                len(DOWNLOAD_RETRY_DELAYS) + 1,
+            )
+        await asyncio.sleep(delay)
 
 
 def rich_transcript_blocks(transcript: str, title: str) -> list[dict[str, object]]:
@@ -801,13 +839,9 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     try:
         source, artifacts_directory = recording_paths(message, data_directory)
         source.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            LOGGER.info("Downloading Telegram audio.")
-            telegram_file = await attachment.get_file()
-            await telegram_file.download_to_drive(custom_path=source)
-            LOGGER.info("Downloaded Telegram audio (%d bytes).", source.stat().st_size)
-        except Exception as error:
-            raise TranscriptionError(f"The audio could not be downloaded: {error}") from error
+        LOGGER.info("Downloading Telegram audio.")
+        await download_audio(attachment, source)
+        LOGGER.info("Downloaded Telegram audio (%d bytes).", source.stat().st_size)
 
         async def report_progress(text: str) -> None:
             if status_message is not None:
@@ -852,7 +886,10 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             selected_tag_ids,
         )
     except Exception as error:
-        LOGGER.exception("Failed to process audio from Telegram user %s", user.id)
+        if isinstance(error, AudioDownloadError):
+            LOGGER.error("Telegram audio download failed (%s).", error.error_type)
+        else:
+            LOGGER.exception("Failed to process audio from Telegram user %s", user.id)
         if isinstance(error, TranscriptStorageError):
             error_text = STORAGE_FAILED_TEXT
         else:
