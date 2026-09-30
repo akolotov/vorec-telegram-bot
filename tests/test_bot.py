@@ -50,6 +50,7 @@ from telegram.error import BadRequest, NetworkError, TimedOut
 from vorec.audio import (
     TITLE_MAX_TOKENS,
     TITLE_REQUEST_TIMEOUT,
+    TITLE_ONLY_REQUEST_TIMEOUT,
     TitleOnly,
     prepare_wav,
     resolve_converter,
@@ -272,6 +273,7 @@ class MiniAppConfigurationTests(unittest.TestCase):
 class TranscriptTitleTests(unittest.TestCase):
     def test_title_request_limits(self) -> None:
         self.assertEqual(TITLE_REQUEST_TIMEOUT, 60)
+        self.assertEqual(TITLE_ONLY_REQUEST_TIMEOUT, 300)
         self.assertEqual(TITLE_MAX_TOKENS, 1024)
 
     def test_schema_requires_a_boolean_for_each_existing_tag(self) -> None:
@@ -458,7 +460,7 @@ class TranscriptTitleTests(unittest.TestCase):
         self.assertEqual(request["response_format"].model_json_schema()["properties"].keys(), {"title"})
         self.assertIn("<TRANSCRIPT>\nFull transcript\n</TRANSCRIPT>", request["messages"][0]["content"])
         self.assertNotIn("no_tags_explanation", request["messages"][0]["content"])
-        client.with_options.assert_called_once_with(timeout=TITLE_REQUEST_TIMEOUT, max_retries=0)
+        client.with_options.assert_called_once_with(timeout=TITLE_ONLY_REQUEST_TIMEOUT, max_retries=0)
 
 
 class RichMessageTests(unittest.TestCase):
@@ -1236,7 +1238,7 @@ class ApplicationConfigurationTests(unittest.TestCase):
         create_web_application.assert_called_once()
         with patch("bot.generate_title_only", return_value="Suggested title") as generate:
             suggestion = asyncio.run(
-                create_web_application.call_args.kwargs["suggest_title"]("Transcript")
+                create_web_application.call_args.kwargs["suggest_title"]("Transcript", "job-id")
             )
         self.assertEqual(suggestion, "Suggested title")
         generate.assert_called_once_with(

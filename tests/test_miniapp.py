@@ -376,7 +376,7 @@ class MiniAppWebTests(unittest.TestCase):
                 webhook_secret_token="webhook-secret",
                 app_path="/apps/bot/",
                 bot_token=TOKEN,
-                allowed_user_ids={101},
+                allowed_user_ids={101, 202},
                 transcript_store=store,
                 configure_menu_buttons=AsyncMock(),
                 suggest_title=suggest_title,
@@ -384,8 +384,19 @@ class MiniAppWebTests(unittest.TestCase):
             headers = {"X-Telegram-Init-Data": signed_data([
                 ("auth_date", str(int(time.time()))), ("user", '{"id":101}'),
             ])}
+            other_headers = {"X-Telegram-Init-Data": signed_data([
+                ("auth_date", str(int(time.time()))), ("user", '{"id":202}'),
+            ])}
             own_url = f"/apps/bot/api/transcripts/{own_id}"
             with TestClient(web) as client:
+                def completed_job(task_id: str):
+                    for _ in range(100):
+                        result = client.get(f"/apps/bot/api/title-jobs/{task_id}", headers=headers)
+                        if result.json()["status"] != "pending":
+                            return result
+                        time.sleep(0.01)
+                    self.fail("Title job did not finish")
+
                 self.assertEqual(client.post(own_url + "/generate-title").status_code, 401)
                 self.assertEqual(client.put(own_url + "/title", json={"title": "No"}).status_code, 401)
                 self.assertEqual(client.post(
@@ -401,9 +412,34 @@ class MiniAppWebTests(unittest.TestCase):
                 suggest_title.assert_not_awaited()
 
                 suggestion = client.post(own_url + "/generate-title", headers=headers)
-                self.assertEqual(suggestion.status_code, 200)
-                self.assertEqual(suggestion.json(), {"title": "AI title"})
-                suggest_title.assert_awaited_once_with("Own text")
+                self.assertEqual(suggestion.status_code, 202)
+                task_id = suggestion.json()["task_id"]
+                self.assertEqual(client.get(f"/apps/bot/api/title-jobs/{task_id}").status_code, 401)
+                self.assertEqual(client.get(
+                    f"/apps/bot/api/title-jobs/{task_id}", headers=other_headers,
+                ).status_code, 404)
+                self.assertEqual(completed_job(task_id).json(), {"status": "ready", "title": "AI title"})
+                suggest_title.assert_awaited_once_with("Own text", task_id)
+                self.assertEqual(client.get(own_url, headers=headers).json()["title"], "Old title")
+
+                gate = client.portal.call(asyncio.Event)
+
+                async def slow_suggestion(_text, _job_id):
+                    await gate.wait()
+                    return "Later title"
+
+                suggest_title.side_effect = slow_suggestion
+                slow = client.post(own_url + "/generate-title", headers=headers)
+                self.assertEqual(slow.status_code, 202)
+                slow_id = slow.json()["task_id"]
+                self.assertEqual(client.post(
+                    own_url + "/generate-title", headers=headers,
+                ).json()["task_id"], slow_id)
+                self.assertEqual(client.get(
+                    f"/apps/bot/api/title-jobs/{slow_id}", headers=headers,
+                ).json(), {"status": "pending"})
+                client.portal.call(gate.set)
+                self.assertEqual(completed_job(slow_id).json(), {"status": "ready", "title": "Later title"})
                 self.assertEqual(client.get(own_url, headers=headers).json()["title"], "Old title")
 
                 title_url = own_url + "/title"
@@ -423,7 +459,8 @@ class MiniAppWebTests(unittest.TestCase):
                 self.assertEqual(groups[0]["items"][0]["title"], "Manual title")
                 suggest_title.side_effect = RuntimeError("Provider details")
                 failure = client.post(own_url + "/generate-title", headers=headers)
-                self.assertEqual(failure.status_code, 502)
+                self.assertEqual(failure.status_code, 202)
+                self.assertEqual(completed_job(failure.json()["task_id"]).json(), {"status": "failed"})
                 self.assertNotIn("Provider details", failure.text)
                 self.assertEqual(store.get_for_user(own_id, 101).title, "Manual title")
 

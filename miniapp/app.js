@@ -41,6 +41,7 @@
   let detailDirty = false;
   let titleGenerationRequestNumber = 0;
   let titleGenerationPending = false;
+  let titleGenerationTaskId = null;
   let pickerRequestNumber = 0;
   let pickerLoaded = false;
   let savePending = false;
@@ -102,12 +103,15 @@
     }
     if (response.status === 401) throw httpError("Сессия завершилась. Откройте приложение снова из меню бота.", 401);
     if (response.status === 409) throw httpError("A category with this name already exists.", 409);
-    if (response.status === 404) throw httpError(
-      path.startsWith("api/transcripts/")
-        ? "Memo not found. Refresh the list."
-        : "Category not found. Refresh the list.",
-      404
-    );
+    if (response.status === 404) {
+      const message = path.startsWith("api/title-jobs/")
+        ? "Generation expired. Please try again."
+        : path.startsWith("api/transcripts/")
+          ? "Memo not found. Refresh the list."
+          : "Category not found. Refresh the list.";
+      throw httpError(message, 404);
+    }
+    if (response.status === 429) throw httpError("Too many title requests. Try again shortly.", 429);
     if (response.status === 400) {
       const result = await response.json();
       throw httpError(result.error || "Invalid category details.", 400);
@@ -262,6 +266,7 @@
   function openTitleEditor() {
     ++titleGenerationRequestNumber;
     titleGenerationPending = false;
+    titleGenerationTaskId = null;
     saveUncertain = false;
     titleInput.value = currentDetailTitle;
     titleEditorStatus.textContent = "";
@@ -275,6 +280,7 @@
   function returnFromTitleEditor() {
     ++titleGenerationRequestNumber;
     titleGenerationPending = false;
+    titleGenerationTaskId = null;
     titleEditorScreen.hidden = true;
     detailScreen.hidden = false;
     webApp?.BackButton?.show();
@@ -288,17 +294,42 @@
     setTitleEditorControls();
     titleEditorStatus.textContent = "Generating…";
     try {
-      const result = await api(`api/transcripts/${currentDetailId}/generate-title`, {
-        method: "POST",
-      });
-      if (request !== titleGenerationRequestNumber || titleEditorScreen.hidden) return;
-      if (typeof result.title !== "string" || !result.title.trim()) {
-        throw new Error("The service returned an empty title. Please try again.");
+      let taskId = titleGenerationTaskId;
+      if (!taskId) {
+        const started = await api(`api/transcripts/${currentDetailId}/generate-title`, {
+          method: "POST",
+        });
+        if (request !== titleGenerationRequestNumber || titleEditorScreen.hidden) return;
+        if (typeof started.task_id !== "string" || !started.task_id) {
+          throw new Error("Could not start title generation. Please try again.");
+        }
+        taskId = started.task_id;
+        titleGenerationTaskId = taskId;
       }
-      titleInput.value = result.title;
-      titleEditorStatus.textContent = "";
+      while (request === titleGenerationRequestNumber && !titleEditorScreen.hidden) {
+        const result = await api(`api/title-jobs/${encodeURIComponent(taskId)}`);
+        if (request !== titleGenerationRequestNumber || titleEditorScreen.hidden) return;
+        if (result.status === "ready") {
+          if (typeof result.title !== "string" || !result.title.trim()) {
+            throw new Error("The service returned an empty title. Please try again.");
+          }
+          titleGenerationTaskId = null;
+          titleInput.value = result.title;
+          titleEditorStatus.textContent = "";
+          break;
+        }
+        if (result.status === "failed") {
+          titleGenerationTaskId = null;
+          throw new Error("Could not generate title. Please try again.");
+        }
+        if (result.status !== "pending") {
+          throw new Error("Unexpected generation status. Please try again.");
+        }
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+      }
     } catch (error) {
       if (request === titleGenerationRequestNumber && !titleEditorScreen.hidden) {
+        if (error.status === 404) titleGenerationTaskId = null;
         titleEditorStatus.textContent = error.message;
       }
     } finally {

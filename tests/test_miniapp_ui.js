@@ -258,6 +258,10 @@ test("Title editor previews AI titles, saves on Apply, and resolves uncertain sa
   let finishGeneration;
   let deferGeneration = false;
   let failGeneration = false;
+  let failJob = false;
+  let failPollOnce = false;
+  let pendingPolls = 0;
+  let postCount = 0;
   let finishPut;
   let deferPut = false;
   let failPutAfterSave = false;
@@ -288,13 +292,25 @@ test("Title editor previews AI titles, saves on Apply, and resolves uncertain sa
     }
     if (url.pathname.endsWith("/api/transcripts/1/generate-title")) {
       assert.equal(options.method, "POST");
+      postCount++;
       if (failGeneration) throw new Error("Offline");
+      return response({task_id: `job-${postCount}`});
+    }
+    if (url.pathname.includes("/api/title-jobs/")) {
+      if (failPollOnce) {
+        failPollOnce = false;
+        throw new Error("Offline");
+      }
       if (deferGeneration) {
         return new Promise((resolve) => {
-          finishGeneration = () => resolve(response({title: "Late AI title"}));
+          finishGeneration = () => resolve(response({status: "ready", title: "Late AI title"}));
         });
       }
-      return response({title: "AI suggestion"});
+      if (pendingPolls > 0) {
+        pendingPolls--;
+        return response({status: "pending"});
+      }
+      return response(failJob ? {status: "failed"} : {status: "ready", title: "AI suggestion"});
     }
     if (url.pathname.endsWith("/api/transcripts/1/title") && options.method === "PUT") {
       puts++;
@@ -322,6 +338,7 @@ test("Title editor previews AI titles, saves on Apply, and resolves uncertain sa
   vm.runInNewContext(source, {
     document, window, fetch, URL, URLSearchParams, Intl,
     requestAnimationFrame: (callback) => callback(),
+    setTimeout: (callback) => setImmediate(callback),
   });
   await flush();
   const initialButton = registry.groups.querySelector('[data-transcript-id="1"]');
@@ -356,7 +373,18 @@ test("Title editor previews AI titles, saves on Apply, and resolves uncertain sa
   assert.equal(registry["title-editor-input"].value, "Another draft");
   assert.equal(registry["title-editor-input"].disabled, false);
   failGeneration = false;
+  failJob = true;
   await registry["title-editor-generate"].dispatch("click");
+  assert.equal(registry["title-editor-input"].value, "Another draft");
+  assert.match(registry["title-editor-status"].textContent, /Could not generate title/);
+  failJob = false;
+  failPollOnce = true;
+  await registry["title-editor-generate"].dispatch("click");
+  assert.equal(registry["title-editor-input"].value, "Another draft");
+  const postsBeforeResume = postCount;
+  pendingPolls = 1;
+  await registry["title-editor-generate"].dispatch("click");
+  assert.equal(postCount, postsBeforeResume);
   assert.equal(registry["title-editor-input"].value, "AI suggestion");
   registry["title-editor-input"].value = "Edited AI title";
   deferPut = true;
