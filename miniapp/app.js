@@ -53,6 +53,11 @@
   const expandedCategories = new Set();
   let currentTags = [];
   let editingTagId = null;
+  let categoryReturnAnchor = null;
+  let categoryGeneration = 0;
+  const categoryCache = new Map();
+  const categorySections = new Map();
+  const LIST_TIMEOUT_MS = 15000;
 
   function formatInstant(value) {
     return dateFormatter.format(new Date(value));
@@ -94,7 +99,24 @@
     return error;
   }
 
-  async function api(path, options = {}) {
+  async function api(path, options = {}, timeoutMs = 0) {
+    if (!timeoutMs) return requestApi(path, options);
+    const controller = new AbortController();
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        reject(new Error("Loading timed out. Please try again."));
+        controller.abort();
+      }, timeoutMs);
+    });
+    try {
+      return await Promise.race([requestApi(path, {...options, signal: controller.signal}), timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function requestApi(path, options = {}) {
     let response;
     try {
       response = await fetch(new URL(path, base), {
@@ -128,36 +150,102 @@
     return response.json();
   }
 
+  function renderItems(group, container, items, replace = true) {
+    if (replace) container.replaceChildren();
+    if (!items.length) {
+      container.textContent = "No memos in this category.";
+      return;
+    }
+    items.forEach((item, index) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "transcript";
+      button.dataset.transcriptId = String(item.id);
+      const title = document.createElement("span");
+      title.className = "transcript-title";
+      title.textContent = item.title;
+      button.append(title, makeTags(item.tags.filter((name) => currentView !== "tags" || name !== group.tag)));
+      button.addEventListener("click", () => {
+        const neighbor = (offset) => {
+          const record = items[index + offset];
+          const element = record && container.querySelector(`[data-transcript-id="${record.id}"]`);
+          return element ? {id: record.id, top: element.getBoundingClientRect().top} : null;
+        };
+        listAnchor = {
+          id: item.id, groupKey: group.key, top: button.getBoundingClientRect().top,
+          next: neighbor(1), previous: neighbor(-1),
+          headingTop: categorySections.get(group.key)?.heading.getBoundingClientRect().top,
+        };
+        openDetail(item.id);
+      });
+      container.append(button);
+    });
+  }
+
+  function loadCategory(group, container) {
+    const cached = categoryCache.get(group.key);
+    if (cached?.items) {
+      renderItems(group, container, cached.items);
+      return Promise.resolve();
+    }
+    if (cached?.pending) return cached.pending;
+    const generation = categoryGeneration;
+    const entry = {};
+    categoryCache.set(group.key, entry);
+    container.replaceChildren();
+    container.textContent = "Loading…";
+    entry.pending = (async () => {
+      try {
+        const params = group.untagged ? "untagged=1" : `tag_id=${group.key}`;
+        const result = group.count === 0 ? {items: []}
+          : await api(`api/transcripts?${params}`, {}, LIST_TIMEOUT_MS);
+        if (generation !== categoryGeneration) return;
+        entry.items = result.items;
+        container.textContent = "";
+        renderItems(group, container, result.items);
+      } catch (error) {
+        if (generation !== categoryGeneration) return;
+        showError(container, error.message, async () => {
+          await loadCategory(group, container);
+          if (generation === categoryGeneration && categoryReturnAnchor?.groupKey === group.key && !listScreen.hidden) {
+            restoreListAnchor(categoryReturnAnchor, requestNumber);
+          }
+        });
+      } finally {
+        entry.pending = null;
+      }
+    })();
+    return entry.pending;
+  }
+
   function renderGroups(groups, anchor = null) {
     groupsElement.replaceChildren();
+    categorySections.clear();
+    const loads = [];
     if (currentView === "tags") {
+      groups.sort((a, b) => Number(Boolean(a.untagged)) - Number(Boolean(b.untagged))
+        || b.count - a.count || (a.tag || "").localeCompare(b.tag || "") || a.key - b.key);
       const keys = new Set(groups.map((group) => group.key));
       expandedCategories.forEach((key) => {
         if (!keys.has(key)) expandedCategories.delete(key);
       });
-      const anchorGroup = anchor && groups.find((group) =>
-        group.items.some((item) => item.id === anchor.id));
-      if (anchorGroup) expandedCategories.add(anchorGroup.key);
+      if (anchor && keys.has(anchor.groupKey)) expandedCategories.add(anchor.groupKey);
     }
-    if (!groups.length) {
-      listStatus.textContent = "Заметок пока нет.";
-      return;
-    }
-    listStatus.textContent = "";
+    listStatus.textContent = groups.length ? "" : "Заметок пока нет.";
     groups.forEach((group) => {
       const section = document.createElement("section");
       section.className = "group";
       const heading = document.createElement("h2");
       heading.className = "group-title";
-      heading.textContent = currentView === "date"
-        ? formatDay(group.key)
+      heading.textContent = currentView === "date" ? formatDay(group.key)
         : group.untagged ? "Uncategorized" : `#${group.tag}`;
       section.append(heading);
-      let itemsContainer = section;
-      if (currentView === "tags") {
+      if (currentView === "date") {
+        renderItems(group, section, group.items, false);
+      } else {
         section.classList.toggle("category-group", true);
         section.dataset.groupKey = String(group.key);
-        itemsContainer = document.createElement("div");
+        const container = document.createElement("div");
         const toggle = document.createElement("button");
         toggle.type = "button";
         toggle.className = "category-toggle";
@@ -165,70 +253,69 @@
         indicator.className = "category-indicator";
         indicator.setAttribute("aria-hidden", "true");
         const name = document.createElement("span");
+        name.className = "category-name";
         name.textContent = heading.textContent;
-        toggle.append(indicator, name);
+        const count = document.createElement("span");
+        count.className = "category-count";
+        count.textContent = String(group.count);
+        toggle.append(indicator, name, count);
         const updateExpanded = () => {
           const expanded = expandedCategories.has(group.key);
-          itemsContainer.hidden = !expanded;
+          container.hidden = !expanded;
           toggle.setAttribute("aria-expanded", String(expanded));
           indicator.textContent = expanded ? "▾" : "▸";
+          return expanded;
         };
         toggle.addEventListener("click", () => {
           if (expandedCategories.has(group.key)) expandedCategories.delete(group.key);
           else expandedCategories.add(group.key);
-          updateExpanded();
+          if (updateExpanded()) return loadCategory(group, container);
         });
         heading.replaceChildren(toggle);
-        section.append(itemsContainer);
-        updateExpanded();
+        section.append(container);
+        categorySections.set(group.key, {section, heading, container});
+        if (updateExpanded()) loads.push(loadCategory(group, container));
       }
-      group.items.forEach((item) => {
-        const button = document.createElement("button");
-        button.type = "button";
-        button.className = "transcript";
-        button.dataset.transcriptId = String(item.id);
-        const title = document.createElement("span");
-        title.className = "transcript-title";
-        title.textContent = item.title;
-        button.append(title, makeTags(item.tags));
-        button.addEventListener("click", () => {
-          listAnchor = {id: item.id, groupKey: group.key, top: button.getBoundingClientRect().top};
-          openDetail(item.id);
-        });
-        itemsContainer.append(button);
-      });
       groupsElement.append(section);
     });
+    return Promise.allSettled(loads);
   }
 
   function restoreListAnchor(anchor, request) {
     requestAnimationFrame(() => {
       if (listScreen.hidden || request !== requestNumber) return;
-      const button = groupsElement.querySelector(`[data-transcript-id="${anchor.id}"]`);
-      if (button) {
-        window.scrollTo(0, window.scrollY + button.getBoundingClientRect().top - anchor.top);
-      } else {
-        window.scrollTo(0, 0);
+      const category = currentView === "tags" && categorySections.get(anchor.groupKey);
+      const container = currentView === "tags" ? category?.container : groupsElement;
+      for (const candidate of [anchor, anchor.next, anchor.previous]) {
+        const button = candidate && container?.querySelector(`[data-transcript-id="${candidate.id}"]`);
+        if (button) {
+          window.scrollTo(0, window.scrollY + button.getBoundingClientRect().top - candidate.top);
+          return;
+        }
       }
+      if (category) window.scrollTo(0, window.scrollY + category.heading.getBoundingClientRect().top - anchor.headingTop);
+      else window.scrollTo(0, 0);
     });
   }
 
   async function loadList(anchor = null) {
     const request = ++requestNumber;
+    ++categoryGeneration;
+    categoryReturnAnchor = anchor;
+    categoryCache.clear();
+    categorySections.clear();
     refreshButton.disabled = true;
     groupsElement.replaceChildren();
     listStatus.textContent = "Загрузка…";
     try {
       const params = new URLSearchParams({view: currentView, timezone});
-      const result = await api(`api/groups?${params}`);
+      const result = await api(`api/groups?${params}`, {}, currentView === "tags" ? LIST_TIMEOUT_MS : 0);
       if (request === requestNumber) {
-        renderGroups(result.groups, anchor);
+        await renderGroups(result.groups, anchor);
         if (anchor) restoreListAnchor(anchor, request);
       }
     } catch (error) {
-      if (request === requestNumber) {
-        showError(listStatus, error.message, () => loadList(anchor));
-      }
+      if (request === requestNumber) showError(listStatus, error.message, () => loadList(anchor));
     } finally {
       if (request === requestNumber) refreshButton.disabled = false;
     }
@@ -253,8 +340,11 @@
     const refresh = returningFromSettings || (returningFromDetail && detailDirty);
     detailDirty = false;
     if (refresh) loadList(anchor);
-    else if (anchor) restoreListAnchor(anchor, requestNumber);
-    else window.scrollTo(0, 0);
+    else {
+      refreshButton.disabled = false;
+      if (anchor) restoreListAnchor(anchor, requestNumber);
+      else window.scrollTo(0, 0);
+    }
   }
 
   function resetCopyState() {

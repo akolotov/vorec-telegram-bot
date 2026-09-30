@@ -378,6 +378,24 @@ class TranscriptStore:
             raise TranscriptStorageError("Could not read personal tag usage.") from error
         return tuple(TagUsage(*row) for row in rows)
 
+    def category_counts_for_user(self, telegram_user_id: int) -> list[dict[str, object]]:
+        """Read all personal categories, including empty and untagged groups."""
+        tags = self.list_tag_usage_for_user(telegram_user_id)
+        try:
+            with self._connect() as connection:
+                untagged = connection.execute(
+                    """SELECT COUNT(*) FROM transcripts AS t
+                    WHERE t.telegram_user_id = ? AND NOT EXISTS (
+                        SELECT 1 FROM transcript_tags WHERE transcript_id = t.id
+                    )""", (telegram_user_id,),
+                ).fetchone()[0]
+        except (OSError, sqlite3.Error) as error:
+            raise TranscriptStorageError("Could not read category counts.") from error
+        return [
+            {"key": tag.id, "tag": tag.name, "untagged": False, "count": tag.usage_count}
+            for tag in tags
+        ] + [{"key": "untagged", "tag": None, "untagged": True, "count": untagged}]
+
     def replace_tags_for_user(
         self, transcript_id: int, telegram_user_id: int, tag_ids: tuple[int, ...]
     ) -> bool:
@@ -448,19 +466,34 @@ class TranscriptStore:
             raise TranscriptStorageError("Could not read transcripts.") from error
         return [(row[0], TranscriptRecord(*row[1:])) for row in rows]
 
-    def list_for_user(self, telegram_user_id: int) -> list[TranscriptSummary]:
-        """Read a user's transcript metadata and personal tags in one query."""
+    def list_for_user(
+        self, telegram_user_id: int, *, tag_id: int | None = None, untagged: bool = False
+    ) -> list[TranscriptSummary]:
+        """Read filtered transcript metadata, preserving all assigned tags."""
+        condition = ""
+        parameters = [telegram_user_id]
+        if tag_id is not None:
+            condition = (
+                " AND EXISTS (SELECT 1 FROM transcript_tags AS selected"
+                " WHERE selected.transcript_id = t.id AND selected.tag_id = ?)"
+            )
+            parameters.append(tag_id)
+        elif untagged:
+            condition = (
+                " AND NOT EXISTS (SELECT 1 FROM transcript_tags AS selected"
+                " WHERE selected.transcript_id = t.id)"
+            )
         try:
             with self._connect() as connection:
                 rows = connection.execute(
-                    """SELECT t.id, t.created_at, t.title, tag.id, tag.name
+                    f"""SELECT t.id, t.created_at, t.title, tag.id, tag.name
                     FROM transcripts AS t
                     LEFT JOIN transcript_tags AS tt
                         ON tt.transcript_id = t.id
                     LEFT JOIN tags AS tag ON tag.id = tt.tag_id
-                    WHERE t.telegram_user_id = ?
+                    WHERE t.telegram_user_id = ?{condition}
                     ORDER BY t.created_at DESC, t.id DESC, tag.name, tag.id""",
-                    (telegram_user_id,),
+                    parameters,
                 ).fetchall()
         except (OSError, sqlite3.Error) as error:
             raise TranscriptStorageError("Could not read transcripts.") from error

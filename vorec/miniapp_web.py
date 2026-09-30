@@ -17,7 +17,7 @@ from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Route
 from telegram import Update
 
-from vorec.library import group_by_date, group_by_tags, transcript_detail, validated_timezone
+from vorec.library import group_by_date, transcript_item, transcript_detail, validated_timezone
 from vorec.miniapp_auth import InvalidInitData, verify_init_data
 from vorec.storage import (
     TagConflictError,
@@ -135,11 +135,10 @@ def create_web_application(
             return JSONResponse({"error": "Invalid view"}, status_code=400, headers=NO_STORE)
         try:
             validated_timezone(timezone_name)
-            records = transcript_store.list_for_user(user_id)
             grouped = (
-                group_by_date(records, timezone_name)
+                group_by_date(transcript_store.list_for_user(user_id), timezone_name)
                 if view == "date"
-                else group_by_tags(records)
+                else transcript_store.category_counts_for_user(user_id)
             )
         except ValueError:
             return JSONResponse({"error": "Invalid timezone"}, status_code=400, headers=NO_STORE)
@@ -147,6 +146,34 @@ def create_web_application(
             LOGGER.exception("Could not load transcript list.")
             return JSONResponse({"error": "Unavailable"}, status_code=500, headers=NO_STORE)
         return JSONResponse({"view": view, "groups": grouped}, headers=NO_STORE)
+
+    async def category_items(request: Request) -> Response:
+        user_id = authenticated_user(request)
+        if user_id is None:
+            return JSONResponse({"error": "Unauthorized"}, status_code=401, headers=NO_STORE)
+        params = request.query_params
+        tag_id = None
+        if len(params.multi_items()) != 1:
+            return JSONResponse({"error": "Expected one category filter"}, status_code=400, headers=NO_STORE)
+        if "tag_id" in params:
+            raw_id = params["tag_id"]
+            if not raw_id.isascii() or not raw_id.isdecimal() or len(raw_id) > 19:
+                return JSONResponse({"error": "Invalid tag ID"}, status_code=400, headers=NO_STORE)
+            tag_id = int(raw_id)
+            if not 0 < tag_id <= 9223372036854775807:
+                return JSONResponse({"error": "Invalid tag ID"}, status_code=400, headers=NO_STORE)
+        elif params.get("untagged") != "1":
+            return JSONResponse({"error": "Invalid category filter"}, status_code=400, headers=NO_STORE)
+        try:
+            if tag_id is not None and not any(
+                tag.id == tag_id for tag in transcript_store.list_tags_for_user(user_id)
+            ):
+                return JSONResponse({"error": "Not found"}, status_code=404, headers=NO_STORE)
+            records = transcript_store.list_for_user(user_id, tag_id=tag_id, untagged=tag_id is None)
+        except TranscriptStorageError:
+            LOGGER.exception("Could not load category items.")
+            return JSONResponse({"error": "Unavailable"}, status_code=500, headers=NO_STORE)
+        return JSONResponse({"items": [transcript_item(record) for record in records]}, headers=NO_STORE)
 
     async def detail(request: Request) -> Response:
         user_id = authenticated_user(request)
@@ -376,6 +403,7 @@ def create_web_application(
             Route(app_path + "app.js", script, methods=["GET"]),
             Route(app_path + "styles.css", stylesheet, methods=["GET"]),
             Route(app_path + "api/groups", groups, methods=["GET"]),
+            Route(app_path + "api/transcripts", category_items, methods=["GET"]),
             Route(app_path + "api/transcripts/{transcript_id:int}", detail, methods=["GET"]),
             Route(
                 app_path + "api/transcripts/{transcript_id:int}/generate-title",
