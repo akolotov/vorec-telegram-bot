@@ -1,8 +1,8 @@
 # Vorec Telegram Bot
 
 Telegram bot that transcribes allowed users' voice messages and audio files. Its
-read-only Telegram Mini App shows each user's completed transcripts by date or
-personal tag.
+Telegram Mini App shows each user's completed transcripts by date or personal tag
+and lets them edit titles and tags.
 
 ![An Apple Watch with the X-Large face and a single Voice Memos complication](.assets/apple-watch-v8-voice-memo-faces.png)
 
@@ -121,13 +121,22 @@ Telegram's light and dark themes.
 The browser sends Telegram's raw `initData` on each API request. The server
 checks its signature and one-hour lifetime, then accesses only rows owned by the
 signed Telegram user ID. Full transcript text is fetched only after opening a
-title. The Mini App does not edit transcripts.
+title. The Mini App can edit a memo's title or tags, while its transcript text
+remains read-only. The title editor can suggest a new title with AI; suggestions
+are saved only after pressing **Apply**. AI title generation runs in the background:
+the Mini App polls for its result, so loading the inference model does not hold a
+single HTTP request open. Cancel stops polling in the editor; an already started
+generation may finish on the server. Results are kept in memory for ten minutes
+and are lost if the bot restarts. The title-only inference request has a
+five-minute timeout; failures are reported in the editor and can be retried.
 
 The HTTP server writes access logs for Mini App pages, assets, API requests,
 and Telegram webhooks. Each entry contains the client address seen by the
 server, the method, the path and query string, and the response status. It
 does not contain request headers or response bodies. Keep these logs private:
 detail paths contain transcript IDs, and list queries contain the timezone.
+Title generation also logs a job ID, queue wait, inference duration, and failure
+class without logging the transcript text or suggested title.
 
 Tags are personal to a user. Use the gear button on either list view to create,
 rename, describe, or delete them. Stored names are lowercase without `#`, and

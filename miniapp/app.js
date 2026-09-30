@@ -10,6 +10,12 @@
   });
   const listScreen = document.getElementById("list-screen");
   const detailScreen = document.getElementById("detail-screen");
+  const titleEditorScreen = document.getElementById("title-editor-screen");
+  const titleInput = document.getElementById("title-editor-input");
+  const titleEditorStatus = document.getElementById("title-editor-status");
+  const titleEditorApply = document.getElementById("title-editor-apply");
+  const titleEditorCancel = document.getElementById("title-editor-cancel");
+  const titleEditorGenerate = document.getElementById("title-editor-generate");
   const tagPickerScreen = document.getElementById("tag-picker-screen");
   const tagPickerList = document.getElementById("tag-picker-list");
   const tagPickerStatus = document.getElementById("tag-picker-status");
@@ -30,8 +36,12 @@
   let tagRequestNumber = 0;
   let settingsSession = 0;
   let currentDetailId = null;
+  let currentDetailTitle = "";
   let currentDetailTagIds = [];
   let detailDirty = false;
+  let titleGenerationRequestNumber = 0;
+  let titleGenerationPending = false;
+  let titleGenerationTaskId = null;
   let pickerRequestNumber = 0;
   let pickerLoaded = false;
   let savePending = false;
@@ -93,15 +103,21 @@
     }
     if (response.status === 401) throw httpError("Сессия завершилась. Откройте приложение снова из меню бота.", 401);
     if (response.status === 409) throw httpError("A category with this name already exists.", 409);
-    if (response.status === 404) throw httpError(
-      path.startsWith("api/transcripts/")
-        ? "Memo not found. Refresh the list."
-        : "Category not found. Refresh the list.",
-      404
-    );
+    if (response.status === 404) {
+      const message = path.startsWith("api/title-jobs/")
+        ? "Generation expired. Please try again."
+        : path.startsWith("api/transcripts/")
+          ? "Memo not found. Refresh the list."
+          : "Category not found. Refresh the list.";
+      throw httpError(message, 404);
+    }
+    if (response.status === 429) throw httpError("Too many title requests. Try again shortly.", 429);
     if (response.status === 400) {
       const result = await response.json();
       throw httpError(result.error || "Invalid category details.", 400);
+    }
+    if (response.status === 502 && path.endsWith("/generate-title")) {
+      throw httpError("Could not generate title. Please try again.", 502);
     }
     if (!response.ok) throw httpError("The request failed. Please try again.", response.status);
     if (response.status === 204) return null;
@@ -184,6 +200,7 @@
     const returningFromDetail = !detailScreen.hidden;
     ++pickerRequestNumber;
     detailScreen.hidden = true;
+    titleEditorScreen.hidden = true;
     tagPickerScreen.hidden = true;
     const returningFromSettings = !settingsScreen.hidden;
     settingsScreen.hidden = true;
@@ -198,6 +215,7 @@
   }
 
   function renderDetail(item) {
+    currentDetailTitle = item.title;
     currentDetailTagIds = item.tag_ids;
     document.getElementById("detail-date").textContent = formatInstant(item.created_at);
     document.getElementById("detail-title").textContent = item.title;
@@ -212,6 +230,7 @@
     currentDetailId = id;
     listScreen.hidden = true;
     settingsScreen.hidden = true;
+    titleEditorScreen.hidden = true;
     detailScreen.hidden = false;
     detailElement.hidden = true;
     detailStatus.textContent = "Загрузка…";
@@ -230,6 +249,156 @@
     const tags = makeTags(names);
     tags.id = "detail-tags";
     return tags;
+  }
+
+  function setTitleEditorControls() {
+    const busy = savePending || titleGenerationPending;
+    titleInput.disabled = busy;
+    titleEditorApply.disabled = busy;
+    titleEditorGenerate.disabled = busy;
+    titleEditorCancel.disabled = savePending;
+    if (!titleEditorScreen.hidden) {
+      if (savePending) webApp?.BackButton?.hide();
+      else webApp?.BackButton?.show();
+    }
+  }
+
+  function openTitleEditor() {
+    ++titleGenerationRequestNumber;
+    titleGenerationPending = false;
+    titleGenerationTaskId = null;
+    saveUncertain = false;
+    titleInput.value = currentDetailTitle;
+    titleEditorStatus.textContent = "";
+    detailScreen.hidden = true;
+    titleEditorScreen.hidden = false;
+    setTitleEditorControls();
+    window.scrollTo(0, 0);
+    titleInput.focus?.({preventScroll: true});
+  }
+
+  function returnFromTitleEditor() {
+    ++titleGenerationRequestNumber;
+    titleGenerationPending = false;
+    titleGenerationTaskId = null;
+    titleEditorScreen.hidden = true;
+    detailScreen.hidden = false;
+    webApp?.BackButton?.show();
+    window.scrollTo(0, 0);
+  }
+
+  async function generateTitle() {
+    if (savePending || titleGenerationPending || titleEditorScreen.hidden) return;
+    const request = ++titleGenerationRequestNumber;
+    titleGenerationPending = true;
+    setTitleEditorControls();
+    titleEditorStatus.textContent = "Generating…";
+    try {
+      let taskId = titleGenerationTaskId;
+      if (!taskId) {
+        const started = await api(`api/transcripts/${currentDetailId}/generate-title`, {
+          method: "POST",
+        });
+        if (request !== titleGenerationRequestNumber || titleEditorScreen.hidden) return;
+        if (typeof started.task_id !== "string" || !started.task_id) {
+          throw new Error("Could not start title generation. Please try again.");
+        }
+        taskId = started.task_id;
+        titleGenerationTaskId = taskId;
+      }
+      while (request === titleGenerationRequestNumber && !titleEditorScreen.hidden) {
+        const result = await api(`api/title-jobs/${encodeURIComponent(taskId)}`);
+        if (request !== titleGenerationRequestNumber || titleEditorScreen.hidden) return;
+        if (result.status === "ready") {
+          if (typeof result.title !== "string" || !result.title.trim()) {
+            throw new Error("The service returned an empty title. Please try again.");
+          }
+          titleGenerationTaskId = null;
+          titleInput.value = result.title;
+          titleEditorStatus.textContent = "";
+          break;
+        }
+        if (result.status === "failed") {
+          titleGenerationTaskId = null;
+          throw new Error("Could not generate title. Please try again.");
+        }
+        if (result.status !== "pending") {
+          throw new Error("Unexpected generation status. Please try again.");
+        }
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+      }
+    } catch (error) {
+      if (request === titleGenerationRequestNumber && !titleEditorScreen.hidden) {
+        if (error.status === 404) titleGenerationTaskId = null;
+        titleEditorStatus.textContent = error.message;
+      }
+    } finally {
+      if (request === titleGenerationRequestNumber && !titleEditorScreen.hidden) {
+        titleGenerationPending = false;
+        setTitleEditorControls();
+      }
+    }
+  }
+
+  async function cancelTitleEditor() {
+    if (savePending || titleEditorScreen.hidden) return;
+    if (!saveUncertain) {
+      returnFromTitleEditor();
+      return;
+    }
+    savePending = true;
+    setTitleEditorControls();
+    titleEditorStatus.textContent = "Checking saved title…";
+    try {
+      const item = await api(`api/transcripts/${currentDetailId}`);
+      renderDetail(item);
+      detailDirty = true;
+      saveUncertain = false;
+      returnFromTitleEditor();
+    } catch (_) {
+      titleEditorStatus.textContent = "Could not confirm saved title. Try Cancel again when connected.";
+    } finally {
+      savePending = false;
+      setTitleEditorControls();
+    }
+  }
+
+  async function applyTitleEditor(event) {
+    event.preventDefault();
+    if (savePending || titleGenerationPending || titleEditorScreen.hidden) return;
+    const title = titleInput.value.trim();
+    if (!title) {
+      titleEditorStatus.textContent = "A title must not be empty.";
+      return;
+    }
+    if (!saveUncertain && title === currentDetailTitle) {
+      returnFromTitleEditor();
+      return;
+    }
+    savePending = true;
+    setTitleEditorControls();
+    titleEditorStatus.textContent = "Saving…";
+    try {
+      const item = await api(`api/transcripts/${currentDetailId}/title`, {
+        method: "PUT",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({title}),
+      });
+      renderDetail(item);
+      detailDirty = true;
+      saveUncertain = false;
+      returnFromTitleEditor();
+    } catch (error) {
+      const rejected = [400, 401, 404, 409, 415].includes(error.status);
+      saveUncertain ||= !rejected;
+      detailDirty ||= saveUncertain || error.status === 404;
+      titleEditorStatus.textContent = saveUncertain
+        ? `${error.message} Retry Apply or Cancel to check saved title.`
+        : error.message;
+    } finally {
+      savePending = false;
+      setTitleEditorControls();
+    }
   }
 
   function setPickerBusy(busy) {
@@ -574,12 +743,17 @@
     document.getElementById("editing-tag-name").focus({preventScroll: true});
   });
   document.getElementById("back-button").addEventListener("click", showList);
+  document.getElementById("edit-detail-title").addEventListener("click", openTitleEditor);
+  document.getElementById("title-editor-form").addEventListener("submit", applyTitleEditor);
+  titleEditorGenerate.addEventListener("click", generateTitle);
+  titleEditorCancel.addEventListener("click", cancelTitleEditor);
   document.getElementById("edit-detail-tags").addEventListener("click", openTagPicker);
   document.getElementById("tag-picker-form").addEventListener("submit", applyTagPicker);
   tagPickerCancel.addEventListener("click", cancelTagPicker);
   webApp?.BackButton?.onClick(() => {
     if (savePending) return;
-    if (!tagPickerScreen.hidden) cancelTagPicker();
+    if (!titleEditorScreen.hidden) cancelTitleEditor();
+    else if (!tagPickerScreen.hidden) cancelTagPicker();
     else showList();
   });
   if (!initData) {

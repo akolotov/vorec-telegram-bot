@@ -28,6 +28,7 @@ from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 
 from vorec.audio import (
+    generate_title_only,
     merge_transcripts,
     prepare_wav,
     resolve_converter,
@@ -931,6 +932,8 @@ def main() -> None:
         timeout=600,
     )
     scheduler = TranscriptionScheduler() if smart_scheduling else None
+    stage_locks = StageLocks()
+    title_model = os.getenv("TITLE_MODEL", DEFAULT_TITLE_MODEL)
     transcript_store = TranscriptStore(DATA_DIRECTORY / "vorec.sqlite3")
     transcript_store.initialize()
 
@@ -940,7 +943,7 @@ def main() -> None:
     )
     app.bot_data.update(
         allowed_user_ids=user_ids,
-        stage_locks=StageLocks(),
+        stage_locks=stage_locks,
         primary_inference_client=primary_inference_client,
         primary_transcription_model=os.getenv(
             "PRIMARY_TRANSCRIPTION_MODEL", DEFAULT_PRIMARY_TRANSCRIPTION_MODEL
@@ -948,7 +951,7 @@ def main() -> None:
         secondary_inference_client=secondary_inference_client,
         secondary_transcription_model=secondary_transcription_model,
         merge_model=os.getenv("MERGE_MODEL", DEFAULT_MERGE_MODEL),
-        title_model=os.getenv("TITLE_MODEL", DEFAULT_TITLE_MODEL),
+        title_model=title_model,
         converter=converter,
         transcription_scheduler=scheduler,
         transcript_store=transcript_store,
@@ -967,6 +970,38 @@ def main() -> None:
         for user_id in sorted(user_ids):
             await set_personal_menu_button(bot, user_id, mini_app_url)
 
+    async def suggest_title(transcript: str, job_id: str) -> str:
+        queued_at = time.monotonic()
+        LOGGER.info("Title job %s waiting for primary inference provider.", job_id)
+
+        async def infer() -> str:
+            started_at = time.monotonic()
+            LOGGER.info(
+                "Title job %s inference started after %.1fs queue wait.",
+                job_id, started_at - queued_at,
+            )
+            try:
+                title = await run_blocking_operation(
+                    generate_title_only, transcript, primary_inference_client, title_model
+                )
+            except Exception as error:
+                LOGGER.warning(
+                    "Title job %s inference failed after %.1fs (%s).",
+                    job_id, time.monotonic() - started_at, error.__class__.__name__,
+                )
+                raise
+            LOGGER.info(
+                "Title job %s inference finished in %.1fs.",
+                job_id, time.monotonic() - started_at,
+            )
+            return title
+
+        if scheduler is None:
+            async with stage_locks.primary:
+                return await infer()
+        async with scheduler.reserve((TranscriptionResource.PRIMARY,)):
+            return await infer()
+
     web_application = create_web_application(
         app,
         webhook_path=webhook_path,
@@ -977,6 +1012,7 @@ def main() -> None:
         allowed_user_ids=user_ids,
         transcript_store=transcript_store,
         configure_menu_buttons=configure_all_menu_buttons,
+        suggest_title=suggest_title,
     )
     LOGGER.info(
         "Starting HTTP listener on %s:%d for Telegram at %s and Mini App at %s "

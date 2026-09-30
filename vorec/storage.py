@@ -19,6 +19,10 @@ class TagValidationError(TranscriptStorageError):
     """A tag name or description is invalid."""
 
 
+class TitleValidationError(TranscriptStorageError):
+    """A transcript title is invalid."""
+
+
 class TagConflictError(TranscriptStorageError):
     """A user already has a tag with this name."""
 
@@ -409,6 +413,23 @@ class TranscriptStore:
             raise
         except (OSError, sqlite3.Error) as error:
             raise TranscriptStorageError("Could not update transcript tags.") from error
+
+    def update_title_for_user(
+        self, transcript_id: int, telegram_user_id: int, title: str
+    ) -> bool:
+        """Update only the title of an owned transcript."""
+        title = title.strip()
+        if not title:
+            raise TitleValidationError("A title must not be empty.")
+        try:
+            with self._connect() as connection:
+                cursor = connection.execute(
+                    "UPDATE transcripts SET title = ? WHERE id = ? AND telegram_user_id = ?",
+                    (title, transcript_id, telegram_user_id),
+                )
+                return bool(cursor.rowcount)
+        except (OSError, sqlite3.Error) as error:
+            raise TranscriptStorageError("Could not update transcript title.") from error
 
     def list_all_records(self) -> list[TranscriptRecord]:
         """Read every complete transcript for archive metadata regeneration."""

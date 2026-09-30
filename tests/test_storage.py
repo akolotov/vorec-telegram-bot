@@ -7,6 +7,7 @@ from vorec.storage import (
     SCHEMA_VERSION,
     TagConflictError,
     TagValidationError,
+    TitleValidationError,
     TranscriptRecord,
     TranscriptStorageError,
     TranscriptStore,
@@ -244,6 +245,22 @@ class TranscriptStoreTests(unittest.TestCase):
                     connection.execute("SELECT COUNT(*) FROM transcript_tags").fetchone()[0],
                     1,
                 )
+
+    def test_update_title_changes_only_owned_transcript_title(self) -> None:
+        with TemporaryDirectory() as directory:
+            store = TranscriptStore(Path(directory) / "vorec.sqlite3")
+            store.initialize()
+            tag = store.create_tag(101, "work", "Work notes")
+            store.save_with_tags(transcript_record(), (tag.id,))
+            transcript_id = store.list_for_user(101)[0].id
+            with self.assertRaises(TitleValidationError):
+                store.update_title_for_user(transcript_id, 101, "  ")
+            self.assertFalse(store.update_title_for_user(transcript_id, 202, "Stolen"))
+            self.assertTrue(store.update_title_for_user(transcript_id, 101, "  New title  "))
+            detail = store.get_for_user(transcript_id, 101)
+            self.assertEqual(detail.title, "New title")
+            self.assertEqual(detail.text, "Completed transcript")
+            self.assertEqual([item.name for item in detail.tags], ["work"])
 
     def test_save_with_tags_replaces_links_and_keeps_title_atomic(self) -> None:
         with TemporaryDirectory() as directory:

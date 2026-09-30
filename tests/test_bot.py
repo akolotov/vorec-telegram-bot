@@ -50,8 +50,11 @@ from telegram.error import BadRequest, NetworkError, TimedOut
 from vorec.audio import (
     TITLE_MAX_TOKENS,
     TITLE_REQUEST_TIMEOUT,
+    TITLE_ONLY_REQUEST_TIMEOUT,
+    TitleOnly,
     prepare_wav,
     resolve_converter,
+    generate_title_only,
     generate_transcript_title,
     title_response_model,
 )
@@ -270,6 +273,7 @@ class MiniAppConfigurationTests(unittest.TestCase):
 class TranscriptTitleTests(unittest.TestCase):
     def test_title_request_limits(self) -> None:
         self.assertEqual(TITLE_REQUEST_TIMEOUT, 60)
+        self.assertEqual(TITLE_ONLY_REQUEST_TIMEOUT, 300)
         self.assertEqual(TITLE_MAX_TOKENS, 1024)
 
     def test_schema_requires_a_boolean_for_each_existing_tag(self) -> None:
@@ -438,6 +442,25 @@ class TranscriptTitleTests(unittest.TestCase):
         with self.assertRaises(LengthFinishReasonError):
             generate_transcript_title("Full transcript", client, "title-model")
         self.assertEqual(title_client.chat.completions.parse.call_count, 3)
+
+
+    def test_title_only_generation_has_no_tag_fields(self) -> None:
+        parsed = TitleOnly.model_validate({"title": "  Конкретный план поездки в Казань  "})
+        response = Mock(choices=[Mock(message=Mock(parsed=parsed))])
+        title_client = Mock()
+        title_client.chat.completions.parse.return_value = response
+        client = Mock()
+        client.with_options.return_value = title_client
+
+        self.assertEqual(
+            generate_title_only("Full transcript", client, "title-model"),
+            "Конкретный план поездки в Казань",
+        )
+        request = title_client.chat.completions.parse.call_args.kwargs
+        self.assertEqual(request["response_format"].model_json_schema()["properties"].keys(), {"title"})
+        self.assertIn("<TRANSCRIPT>\nFull transcript\n</TRANSCRIPT>", request["messages"][0]["content"])
+        self.assertNotIn("no_tags_explanation", request["messages"][0]["content"])
+        client.with_options.assert_called_once_with(timeout=TITLE_ONLY_REQUEST_TIMEOUT, max_retries=0)
 
 
 class RichMessageTests(unittest.TestCase):
@@ -1213,6 +1236,14 @@ class ApplicationConfigurationTests(unittest.TestCase):
             transcript_store.return_value,
         )
         create_web_application.assert_called_once()
+        with patch("bot.generate_title_only", return_value="Suggested title") as generate:
+            suggestion = asyncio.run(
+                create_web_application.call_args.kwargs["suggest_title"]("Transcript", "job-id")
+            )
+        self.assertEqual(suggestion, "Suggested title")
+        generate.assert_called_once_with(
+            "Transcript", openai.return_value, DEFAULT_TITLE_MODEL
+        )
         uvicorn_run.assert_called_once_with(
             create_web_application.return_value,
             host="0.0.0.0",
