@@ -10,7 +10,9 @@ from unittest.mock import AsyncMock, Mock, call, patch
 import httpx
 from openai import BadRequestError, LengthFinishReasonError
 from bot import (
+    AudioDownloadError,
     ConfigurationError,
+    DOWNLOAD_FAILED_TEXT,
     DEFAULT_TITLE_MODEL,
     DELIVERY_FAILED_TEXT,
     DELIVERY_UNCONFIRMED_TEXT,
@@ -31,6 +33,7 @@ from bot import (
     allowed_user_ids,
     boolean_env,
     deliver_transcript,
+    download_audio,
     edit_rich_transcript_message,
     ensure_menu_on_first_message,
     handle_audio,
@@ -777,6 +780,72 @@ class TranscriptDeliveryTests(unittest.TestCase):
         )
 
 
+class AudioDownloadTests(unittest.TestCase):
+    def test_success_and_transient_failures(self) -> None:
+        for failure_stage in (None, "get_file", "download"):
+            with self.subTest(failure_stage=failure_stage):
+                source = Path("audio.ogg")
+                telegram_file = Mock(download_to_drive=AsyncMock())
+                attachment = Mock(get_file=AsyncMock(return_value=telegram_file))
+                if failure_stage == "get_file":
+                    attachment.get_file.side_effect = [NetworkError("offline"), telegram_file]
+                elif failure_stage == "download":
+                    telegram_file.download_to_drive.side_effect = [TimedOut("stalled"), None]
+                with patch("bot.asyncio.sleep", new_callable=AsyncMock) as sleep:
+                    asyncio.run(download_audio(attachment, source))
+                attachment.get_file.assert_awaited()
+                self.assertEqual(attachment.get_file.await_count, 1 if failure_stage is None else 2)
+                for request in telegram_file.download_to_drive.await_args_list:
+                    self.assertEqual(request, call(custom_path=source, read_timeout=30))
+                if failure_stage is None:
+                    sleep.assert_not_awaited()
+                else:
+                    sleep.assert_awaited_once_with(1)
+
+    def test_exhausts_three_attempts(self) -> None:
+        telegram_file = Mock(download_to_drive=AsyncMock(side_effect=TimedOut("stalled")))
+        attachment = Mock(get_file=AsyncMock(return_value=telegram_file))
+        with patch("bot.asyncio.sleep", new_callable=AsyncMock) as sleep:
+            with self.assertRaises(AudioDownloadError) as caught:
+                asyncio.run(download_audio(attachment, Path("audio.ogg")))
+        self.assertEqual(attachment.get_file.await_count, 3)
+        self.assertEqual(telegram_file.download_to_drive.await_count, 3)
+        self.assertEqual(sleep.await_args_list, [call(1), call(2)])
+        self.assertEqual(str(caught.exception), DOWNLOAD_FAILED_TEXT)
+        self.assertEqual(caught.exception.error_type, "TimedOut")
+        self.assertTrue(caught.exception.__suppress_context__)
+
+    def test_permanent_errors_are_not_retried(self) -> None:
+        for error in (BadRequest("invalid file"), OSError("disk unavailable"), ValueError("invalid")):
+            with self.subTest(error_type=type(error).__name__):
+                telegram_file = Mock(download_to_drive=AsyncMock(side_effect=error))
+                attachment = Mock(get_file=AsyncMock(return_value=telegram_file))
+                with patch("bot.asyncio.sleep", new_callable=AsyncMock) as sleep:
+                    with self.assertRaises(AudioDownloadError):
+                        asyncio.run(download_audio(attachment, Path("audio.ogg")))
+                telegram_file.download_to_drive.assert_awaited_once()
+                sleep.assert_not_awaited()
+
+    def test_cancellation_is_propagated(self) -> None:
+        for stage in ("get_file", "download", "sleep"):
+            with self.subTest(stage=stage):
+                telegram_file = Mock(download_to_drive=AsyncMock())
+                attachment = Mock(get_file=AsyncMock(return_value=telegram_file))
+                if stage == "get_file":
+                    attachment.get_file.side_effect = asyncio.CancelledError()
+                elif stage == "download":
+                    telegram_file.download_to_drive.side_effect = asyncio.CancelledError()
+                else:
+                    telegram_file.download_to_drive.side_effect = TimedOut("stalled")
+                with patch("bot.asyncio.sleep", new_callable=AsyncMock) as sleep:
+                    sleep.side_effect = asyncio.CancelledError()
+                    with self.assertRaises(asyncio.CancelledError):
+                        asyncio.run(download_audio(attachment, Path("audio.ogg")))
+                attachment.get_file.assert_awaited_once()
+                if stage != "sleep":
+                    sleep.assert_not_awaited()
+
+
 class HandleAudioTests(unittest.TestCase):
     def audio_request(
         self,
@@ -790,7 +859,7 @@ class HandleAudioTests(unittest.TestCase):
     ):
         telegram_file = Mock()
         telegram_file.download_to_drive = AsyncMock(
-            side_effect=lambda custom_path: Path(custom_path).touch()
+            side_effect=lambda custom_path, **kwargs: Path(custom_path).touch()
         )
         attachment = Mock(file_name="memo.ogg")
         attachment.get_file = AsyncMock(return_value=telegram_file)
@@ -829,6 +898,74 @@ class HandleAudioTests(unittest.TestCase):
         }
         artifacts = source.parent / "artifacts"
         return update, context, message, bot, artifacts
+
+    @patch("bot.transcribe_recording", new_callable=AsyncMock)
+    @patch("bot.recording_paths")
+    def test_download_failure_does_not_expose_secrets(
+        self, recording_paths, transcribe_recording
+    ) -> None:
+        secret = "FAKE_DOWNLOAD_TOKEN_12345"
+        for error_type in (TimedOut, BadRequest, OSError):
+            for fallback_reply in (False, True):
+                with self.subTest(error_type=error_type.__name__, fallback=fallback_reply):
+                    with TemporaryDirectory() as directory:
+                        source = Path(directory) / "audio.ogg"
+                        status = Mock(chat_id=123, message_id=789)
+                        status.edit_text = AsyncMock(
+                            side_effect=RuntimeError("edit unavailable") if fallback_reply else None
+                        )
+                        update, context, message, bot, artifacts = self.audio_request(source, status)
+                        error = error_type(f"https://example.test/file/bot{secret}/audio.ogg")
+                        error.__cause__ = httpx.ReadTimeout(secret)
+                        update.effective_message.voice.get_file.return_value.download_to_drive.side_effect = error
+                        recording_paths.return_value = (source, artifacts)
+                        with patch("bot.asyncio.sleep", new_callable=AsyncMock), self.assertLogs(
+                            "bot", level="WARNING"
+                        ) as captured:
+                            asyncio.run(handle_audio(update, context))
+                        expected = f"<i>Could not transcribe the audio: {DOWNLOAD_FAILED_TEXT}</i>"
+                        status.edit_text.assert_awaited_once_with(expected, parse_mode="HTML")
+                        if fallback_reply:
+                            self.assertEqual(message.reply_text.await_args.args[0], expected)
+                            self.assertEqual(message.reply_text.await_count, 2)
+                        else:
+                            self.assertEqual(message.reply_text.await_count, 1)
+                        output = "\n".join(captured.output)
+                        self.assertNotIn(secret, output)
+                        self.assertNotIn(secret, str(status.edit_text.await_args_list))
+                        self.assertNotIn(secret, str(message.reply_text.await_args_list))
+                        self.assertTrue(all(record.exc_info is None for record in captured.records))
+                        transcribe_recording.assert_not_awaited()
+                        context.application.bot_data["transcript_store"].save_with_tags.assert_not_called()
+                        bot._post.assert_not_awaited()
+
+    @patch("bot.transcribe_recording", new_callable=AsyncMock,
+           return_value=("final text", "Specific title", ()))
+    @patch("bot.recording_paths")
+    def test_download_retry_processes_and_delivers_once(
+        self, recording_paths, transcribe_recording
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / "audio.ogg"
+            status = Mock(chat_id=123, message_id=789, edit_text=AsyncMock())
+            update, context, message, bot, artifacts = self.audio_request(source, status)
+            recording_paths.return_value = (source, artifacts)
+            attempts = 0
+
+            async def download(custom_path, **kwargs):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise TimedOut("stalled")
+                Path(custom_path).touch()
+
+            message.voice.get_file.return_value.download_to_drive.side_effect = download
+            with patch("bot.asyncio.sleep", new_callable=AsyncMock):
+                asyncio.run(handle_audio(update, context))
+            self.assertEqual(attempts, 2)
+            transcribe_recording.assert_awaited_once()
+            context.application.bot_data["transcript_store"].save_with_tags.assert_called_once()
+            bot._post.assert_awaited_once()
 
     @patch("bot.transcribe_recording")
     @patch("bot.recording_paths")
