@@ -30,6 +30,9 @@
   const refreshButton = document.getElementById("refresh-button");
   const detailStatus = document.getElementById("detail-status");
   const detailElement = document.getElementById("detail");
+  const copyDetailButton = document.getElementById("copy-detail-text");
+  const copyDetailStatus = document.getElementById("copy-detail-status");
+  let copyRequestNumber = 0;
   const tabs = {date: document.getElementById("date-tab"), tags: document.getElementById("tags-tab")};
   let currentView = "date";
   let requestNumber = 0;
@@ -194,6 +197,7 @@
 
   function showList() {
     if (savePending) return;
+    resetCopyState();
     ++requestNumber;
     ++tagRequestNumber;
     ++settingsSession;
@@ -214,7 +218,36 @@
     else window.scrollTo(0, 0);
   }
 
+  function resetCopyState() {
+    ++copyRequestNumber;
+    copyDetailButton.disabled = false;
+    copyDetailStatus.textContent = "";
+  }
+
+  async function copyDetailText() {
+    if (copyDetailButton.disabled || detailScreen.hidden || detailElement.hidden) return;
+    const request = ++copyRequestNumber;
+    copyDetailStatus.textContent = "";
+    const clipboard = window.navigator?.clipboard;
+    if (typeof clipboard?.writeText !== "function") {
+      copyDetailStatus.textContent = "Copying is unavailable in this client.";
+      return;
+    }
+    copyDetailButton.disabled = true;
+    try {
+      await clipboard.writeText(document.getElementById("detail-text").textContent);
+      if (request === copyRequestNumber) copyDetailStatus.textContent = "Copied";
+    } catch {
+      if (request === copyRequestNumber) {
+        copyDetailStatus.textContent = "Could not copy text. Please try again.";
+      }
+    } finally {
+      if (request === copyRequestNumber) copyDetailButton.disabled = false;
+    }
+  }
+
   function renderDetail(item) {
+    resetCopyState();
     currentDetailTitle = item.title;
     currentDetailTagIds = item.tag_ids;
     document.getElementById("detail-date").textContent = formatInstant(item.created_at);
@@ -226,6 +259,7 @@
   }
 
   async function openDetail(id) {
+    resetCopyState();
     const request = ++requestNumber;
     currentDetailId = id;
     listScreen.hidden = true;
@@ -744,6 +778,7 @@
   });
   document.getElementById("back-button").addEventListener("click", showList);
   document.getElementById("edit-detail-title").addEventListener("click", openTitleEditor);
+  copyDetailButton.addEventListener("click", copyDetailText);
   document.getElementById("title-editor-form").addEventListener("submit", applyTitleEditor);
   titleEditorGenerate.addEventListener("click", generateTitle);
   titleEditorCancel.addEventListener("click", cancelTitleEditor);
