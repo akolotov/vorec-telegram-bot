@@ -15,6 +15,7 @@ class Element {
     this.disabled = false;
     this.checked = false;
     this.textContent = "";
+    this.attributes = {};
     this.classList = {toggle() {}};
   }
 
@@ -73,7 +74,7 @@ class Element {
   }
 
   getBoundingClientRect() { return {top: 100}; }
-  setAttribute() {}
+  setAttribute(name, value) { this.attributes[name] = value; }
 }
 
 function response(body) {
@@ -649,4 +650,171 @@ test("Refresh reloads the current view at the top and preserves detail return po
   await registry["back-button"].dispatch("click");
   assert.equal(window.scrollY, 420);
   assert.equal(groupReads, 5);
+});
+
+async function categoryHarness() {
+  const registry = {};
+  const html = fs.readFileSync(path.join(__dirname, "../miniapp/index.html"), "utf8");
+  for (const [, id] of html.matchAll(/id="([^"]+)"/g)) new Element("div", registry).id = id;
+  const parent = new Element("div", registry);
+  parent.append(registry["detail-tags"]);
+  for (const id of ["detail-screen", "settings-screen", "tag-picker-screen", "title-editor-screen"]) {
+    registry[id].hidden = true;
+  }
+  const item = (id) => ({id, title: `Memo ${id}`, tags: []});
+  const state = {
+    groups: [
+      {key: 1, tag: "work", items: [item(1), item(2)]},
+      {key: 2, tag: "travel", items: [item(3)]},
+      {key: "untagged", untagged: true, items: [item(4)]},
+    ],
+    groupReads: 0, failNext: false, height: 2400, viewport: 800,
+    memo: {id: 1, title: "Memo 1", created_at: "2026-09-24T10:00:00+00:00",
+      tags: ["work"], tag_ids: [1], text: "Text"},
+    positions: new Map([[1, 520]]),
+  };
+  let telegramBack;
+  const window = {
+    location: {href: "https://example.test/apps/bot/"}, scrollY: 0,
+    scrollTo(_x, y) { this.scrollY = Math.max(0, Math.min(y, state.height - state.viewport)); },
+    Telegram: {WebApp: {
+      initData: "signed-data", ready() {}, expand() {},
+      BackButton: {onClick(callback) { telegramBack = callback; }, hide() {}, show() {}},
+    }},
+  };
+  const fetch = async (url, options = {}) => {
+    if (url.pathname.endsWith("/api/groups")) {
+      state.groupReads++;
+      if (state.failNext) { state.failNext = false; throw new Error("Connection lost"); }
+      return response({groups: url.searchParams.get("view") === "tags" ? state.groups : [
+        {key: "2026-09-24", items: [item(1)]},
+      ]});
+    }
+    if (url.pathname.endsWith("/api/tags")) return response({tags: [
+      {id: 1, name: "work"}, {id: 2, name: "travel"},
+    ]});
+    if (options.method === "PUT") {
+      const body = JSON.parse(options.body);
+      state.memo = {...state.memo, ...body};
+      if (body.tag_ids) state.memo.tags = ["travel"];
+      for (const group of state.groups) {
+        for (const memo of group.items) if (memo.id === 1) memo.title = state.memo.title;
+      }
+    }
+    return response(state.memo);
+  };
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname, "../miniapp/app.js"), "utf8"), {
+    document: {
+      getElementById: (id) => registry[id],
+      createElement(tag) {
+        const element = new Element(tag, registry);
+        element.getBoundingClientRect = () => ({
+          top: (state.positions.get(Number(element.dataset.transcriptId)) || 100) - window.scrollY,
+        });
+        return element;
+      },
+      createTextNode: (text) => new Element(text, registry),
+    },
+    window, fetch, URL, URLSearchParams, Intl, requestAnimationFrame: (callback) => callback(),
+  });
+  await flush();
+  const click = async (id) => { await registry[id].dispatch("click"); await flush(); };
+  const group = (key) => registry.groups.children.find((section) => section.dataset.groupKey === String(key));
+  const toggle = (key) => group(key).children[0].children[0];
+  const expanded = (key) => {
+    const section = group(key);
+    assert.equal(toggle(key).attributes["aria-expanded"], String(!section.children[1].hidden));
+    return !section.children[1].hidden;
+  };
+  const openMemo = async () => {
+    await registry.groups.querySelector('[data-transcript-id="1"]').dispatch("click");
+    await flush();
+  };
+  return {registry, state, window, click, group, toggle, expanded, openMemo,
+    back: async () => { telegramBack(); await flush(); }};
+}
+
+test("Categories collapse on entry and preserve independent expansion across refresh and settings", async () => {
+  const h = await categoryHarness();
+  await h.click("tags-tab");
+  for (const key of [1, 2, "untagged"]) assert.equal(h.expanded(key), false);
+  const reads = h.state.groupReads;
+  for (const key of [1, 2, "untagged"]) await h.toggle(key).dispatch("click");
+  assert.equal(h.state.groupReads, reads);
+  for (const key of [1, 2, "untagged"]) assert.equal(h.expanded(key), true);
+  await h.toggle(2).dispatch("click");
+  assert.equal(h.expanded(2), false);
+  assert.equal(h.expanded(1), true);
+  h.window.scrollTo(0, 420);
+  await h.click("refresh-button");
+  assert.equal(h.window.scrollY, 0);
+  assert.equal(h.expanded(1), true);
+  assert.equal(h.expanded(2), false);
+  assert.equal(h.expanded("untagged"), true);
+  h.state.failNext = true;
+  await h.click("refresh-button");
+  await h.registry["list-status"].children.at(-1).dispatch("click");
+  await flush();
+  assert.equal(h.expanded(1), true);
+  await h.click("settings-button");
+  await h.click("settings-back-button");
+  assert.equal(h.expanded(1), true);
+  assert.equal(h.expanded("untagged"), true);
+  h.state.groups = h.state.groups.filter((group) => group.key !== "untagged");
+  await h.click("refresh-button");
+  h.state.groups.push({key: "untagged", untagged: true, items: [{id: 4, title: "Memo 4", tags: []}]});
+  await h.click("refresh-button");
+  assert.equal(h.expanded("untagged"), false);
+  await h.click("date-tab");
+  assert.equal(h.registry.groups.children[0].children[1].dataset.transcriptId, "1");
+  await h.click("tags-tab");
+  for (const key of [1, 2, "untagged"]) assert.equal(h.expanded(key), false);
+});
+
+test("Category return restores expansion and reachable position after title edits and regrouping", async () => {
+  const h = await categoryHarness();
+  await h.click("tags-tab");
+  await h.toggle(1).dispatch("click");
+  await h.toggle("untagged").dispatch("click");
+  h.window.scrollTo(0, 420);
+  await h.openMemo();
+  const reads = h.state.groupReads;
+  await h.click("back-button");
+  assert.equal(h.state.groupReads, reads);
+  assert.equal(h.window.scrollY, 420);
+  assert.equal(h.expanded(1), true);
+  assert.equal(h.expanded("untagged"), true);
+  await h.openMemo();
+  await h.click("edit-detail-title");
+  h.registry["title-editor-input"].value = "Changed title";
+  await h.registry["title-editor-form"].dispatch("submit");
+  await h.back();
+  assert.equal(h.state.groupReads, reads + 1);
+  assert.equal(h.window.scrollY, 420);
+  assert.equal(h.expanded(1), true);
+  assert.equal(h.registry.groups.querySelector('[data-transcript-id="1"]').children[0].textContent, "Changed title");
+  await h.openMemo();
+  await h.click("edit-detail-tags");
+  const inputs = h.registry["tag-picker-list"].querySelectorAll("input");
+  inputs.find((input) => input.value === "1").checked = false;
+  inputs.find((input) => input.value === "2").checked = true;
+  await h.registry["tag-picker-form"].dispatch("submit");
+  const memo = h.state.groups[0].items.shift();
+  h.state.groups[1].items.push(memo);
+  h.state.height = 1400;
+  h.state.positions.set(1, 1300);
+  await h.back();
+  assert.equal(h.expanded(2), true);
+  assert.equal(h.expanded(1), true);
+  assert.equal(h.expanded("untagged"), true);
+  assert.equal(h.window.scrollY, 600);
+  const button = h.registry.groups.querySelector('[data-transcript-id="1"]');
+  assert.equal(button.getBoundingClientRect().top, 700);
+  await h.openMemo();
+  await h.click("edit-detail-title");
+  h.registry["title-editor-input"].value = "Deleted elsewhere";
+  await h.registry["title-editor-form"].dispatch("submit");
+  for (const group of h.state.groups) group.items = group.items.filter((item) => item.id !== 1);
+  await h.back();
+  assert.equal(h.window.scrollY, 0);
 });
