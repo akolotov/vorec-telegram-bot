@@ -143,6 +143,30 @@ rename, describe, or delete them. Stored names are lowercase without `#`, and
 the `#` prefix is added in the UI. The bot uses the available tags when it
 classifies new transcripts; changing tags does not reclassify existing ones.
 Deleting a tag removes it from existing transcripts without deleting them.
+
+The category view lists all personal tags, including empty categories, ordered by
+memo count (highest first), then name. Each heading shows its full memo count;
+a memo assigned multiple tags appears in each matching category. Uncategorized
+is always last. Categories start collapsed and load their memo summaries only
+when expanded. Loaded summaries are cached until a list refresh, a return from
+settings or saved memo edits, or a view change. Category metadata and content
+requests have a 15-second timeout, including response-body loading, with retry
+controls. Returning from a memo preserves its original category even if its tag
+was removed; an emptied category stays visible and expanded.
+
+`GET api/groups?view=tags` returns category metadata (`key`, `tag`, `untagged`,
+`count`) without memo items. `GET api/transcripts?tag_id=<id>` or
+`GET api/transcripts?untagged=1` returns all matching memo summaries in an `items`
+array, newest first, including all assigned tag names and excluding transcript
+text. These endpoints use the same Mini App authentication as other API routes.
+The date-view response and tag editing APIs are unchanged. Tags have no parent
+relationships: a broad tag matches only memos explicitly assigned that tag.
+
+This category API replaces the previous grouped-items response. For this
+single-user deployment, fully close the Mini App before updating the server and
+frontend together, then reopen it from the bot menu. An already open older client
+is incompatible; no API-version negotiation or authentication cutoff is used.
+
 Until tags are available, the tag view shows an **Uncategorized** group. A database upgrade from
 schema version 2 expects both tag tables to be empty and stops safely if it
 finds existing tag data.

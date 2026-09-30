@@ -139,7 +139,7 @@ test("Copy text preserves note content and isolates pending copies across notes"
       createElement: (tag) => new Element(tag, registry),
       createTextNode: (value) => new Element(value, registry),
     },
-    requestAnimationFrame: (callback) => callback(),
+    setTimeout, clearTimeout, AbortController, requestAnimationFrame: (callback) => callback(),
   });
   await flush();
   const open = async (id) => {
@@ -292,7 +292,7 @@ test("Tag picker blocks navigation during save and handles failed saves", async 
   const source = fs.readFileSync(path.join(__dirname, "../miniapp/app.js"), "utf8");
   vm.runInNewContext(source, {
     document, window, fetch, URL, URLSearchParams, Intl,
-    requestAnimationFrame: (callback) => callback(),
+    setTimeout, clearTimeout, AbortController, requestAnimationFrame: (callback) => callback(),
   });
   await flush();
   await registry.groups.querySelector('[data-transcript-id="1"]').dispatch("click");
@@ -461,7 +461,7 @@ test("Title editor previews AI titles, saves on Apply, and resolves uncertain sa
   const source = fs.readFileSync(path.join(__dirname, "../miniapp/app.js"), "utf8");
   vm.runInNewContext(source, {
     document, window, fetch, URL, URLSearchParams, Intl,
-    requestAnimationFrame: (callback) => callback(),
+    setTimeout, clearTimeout, AbortController, requestAnimationFrame: (callback) => callback(),
     setTimeout: (callback) => setImmediate(callback),
   });
   await flush();
@@ -602,8 +602,11 @@ test("Refresh reloads the current view at the top and preserves detail return po
         nextGroupResponse = null;
         return pending;
       }
-      return response({groups: [{tag: "work", items}]});
+      return response({groups: url.searchParams.get("view") === "tags"
+        ? [{key: 1, tag: "work", count: items.length, untagged: false}]
+        : [{key: "2026-09-24", items}]});
     }
+    if (url.pathname.endsWith("/api/transcripts")) return response({items});
     if (url.pathname.endsWith("/api/transcripts/1")) {
       return response({
         id: 1, created_at: "2026-09-24T10:00:00+00:00", title: "Memo",
@@ -615,11 +618,12 @@ test("Refresh reloads the current view at the top and preserves detail return po
   const source = fs.readFileSync(path.join(__dirname, "../miniapp/app.js"), "utf8");
   vm.runInNewContext(source, {
     document, window, fetch, URL, URLSearchParams, Intl,
-    requestAnimationFrame: (callback) => callback(),
+    setTimeout, clearTimeout, AbortController, requestAnimationFrame: (callback) => callback(),
   });
   await flush();
   await registry["tags-tab"].dispatch("click");
   await flush();
+  await registry.groups.children[0].children[0].children[0].dispatch("click");
   window.scrollY = 420;
   let finishRefresh;
   nextGroupResponse = new Promise((resolve) => { finishRefresh = resolve; });
@@ -628,9 +632,8 @@ test("Refresh reloads the current view at the top and preserves detail return po
   assert.equal(registry["refresh-button"].disabled, true);
   await registry["refresh-button"].dispatch("click");
   assert.equal(groupReads, 3);
-  finishRefresh(response({groups: [{tag: "work", items: [
-    {id: 2, title: "New memo", tags: ["work"]}, ...items,
-  ]}]}));
+  items.unshift({id: 2, title: "New memo", tags: ["work"]});
+  finishRefresh(response({groups: [{key: 1, tag: "work", count: items.length, untagged: false}]}));
   await refreshing;
   assert.equal(registry["refresh-button"].disabled, false);
   assert.equal(views.at(-1), "tags");
@@ -652,7 +655,7 @@ test("Refresh reloads the current view at the top and preserves detail return po
   assert.equal(groupReads, 5);
 });
 
-async function categoryHarness() {
+async function categoryHarness(timers = {setTimeout, clearTimeout}) {
   const registry = {};
   const html = fs.readFileSync(path.join(__dirname, "../miniapp/index.html"), "utf8");
   for (const [, id] of html.matchAll(/id="([^"]+)"/g)) new Element("div", registry).id = id;
@@ -686,9 +689,19 @@ async function categoryHarness() {
     if (url.pathname.endsWith("/api/groups")) {
       state.groupReads++;
       if (state.failNext) { state.failNext = false; throw new Error("Connection lost"); }
-      return response({groups: url.searchParams.get("view") === "tags" ? state.groups : [
+      if (state.groupResponse) return state.groupResponse;
+      return response({groups: url.searchParams.get("view") === "tags" ? state.groups.map(({items, ...group}) => ({...group, count: items.length})) : [
         {key: "2026-09-24", items: [item(1)]},
       ]});
+    }
+    if (url.pathname.endsWith("/api/transcripts")) {
+      state.itemReads = (state.itemReads || 0) + 1;
+      const key = url.searchParams.has("tag_id") ? Number(url.searchParams.get("tag_id")) : "untagged";
+      if (state.itemResponse) {
+        const result = state.itemResponse(key, options);
+        if (result) return result;
+      }
+      return response({items: state.groups.find((group) => group.key === key).items});
     }
     if (url.pathname.endsWith("/api/tags")) return response({tags: [
       {id: 1, name: "work"}, {id: 2, name: "travel"},
@@ -713,9 +726,9 @@ async function categoryHarness() {
         });
         return element;
       },
-      createTextNode: (text) => new Element(text, registry),
+      createTextNode: (text) => Object.assign(new Element("text", registry), {textContent: text}),
     },
-    window, fetch, URL, URLSearchParams, Intl, requestAnimationFrame: (callback) => callback(),
+    window, fetch, URL, URLSearchParams, Intl, setTimeout: timers.setTimeout, clearTimeout: timers.clearTimeout, AbortController, requestAnimationFrame: (callback) => callback(),
   });
   await flush();
   const click = async (id) => { await registry[id].dispatch("click"); await flush(); };
@@ -804,17 +817,159 @@ test("Category return restores expansion and reachable position after title edit
   h.state.height = 1400;
   h.state.positions.set(1, 1300);
   await h.back();
-  assert.equal(h.expanded(2), true);
+  assert.equal(h.expanded(2), false);
   assert.equal(h.expanded(1), true);
   assert.equal(h.expanded("untagged"), true);
-  assert.equal(h.window.scrollY, 600);
-  const button = h.registry.groups.querySelector('[data-transcript-id="1"]');
-  assert.equal(button.getBoundingClientRect().top, 700);
+  assert.equal(h.window.scrollY, 420);
+  assert.equal(h.group(1).children[1].querySelector('[data-transcript-id="1"]'), undefined);
+  await h.toggle(2).dispatch("click");
   await h.openMemo();
   await h.click("edit-detail-title");
   h.registry["title-editor-input"].value = "Deleted elsewhere";
   await h.registry["title-editor-form"].dispatch("submit");
   for (const group of h.state.groups) group.items = group.items.filter((item) => item.id !== 1);
   await h.back();
+  assert.equal(h.window.scrollY, 420);
+});
+
+
+function manualTimers() {
+  const callbacks = new Map();
+  let next = 0;
+  return {
+    setTimeout(callback, delay) {
+      assert.equal(delay, 15000);
+      callbacks.set(++next, callback);
+      return next;
+    },
+    clearTimeout(id) { callbacks.delete(id); },
+    expire() { for (const callback of [...callbacks.values()]) callback(); },
+    get size() { return callbacks.size; },
+  };
+}
+
+test("Categories sort by complete membership and load only on expansion with caching", async () => {
+  const h = await categoryHarness();
+  h.state.groups[1].items.push({...h.state.groups[0].items[0], tags: ["work", "travel"]});
+  h.state.groups.push({key: 3, tag: "empty", items: []});
+  h.state.groups.push({key: 4, tag: "alpha", items: [{id: 5, title: "Memo 5", tags: []}]});
+  await h.click("tags-tab");
+  assert.deepEqual(h.registry.groups.children.map((section) => section.dataset.groupKey), ["2", "1", "4", "3", "untagged"]);
+  assert.equal(h.state.itemReads || 0, 0);
+  assert.equal(h.toggle(1).children[1].textContent, "#work · 2");
+  await h.toggle(2).dispatch("click");
+  assert.equal(h.state.itemReads, 1);
+  const shared = h.group(2).children[1].querySelector('[data-transcript-id="1"]');
+  assert.equal(shared.children[1].children[0].textContent, "#work");
+  await h.toggle(2).dispatch("click");
+  await h.toggle(2).dispatch("click");
+  assert.equal(h.state.itemReads, 1);
+  await h.toggle(1).dispatch("click");
+  assert.ok(h.group(1).children[1].querySelector('[data-transcript-id="1"]'));
+  await h.toggle(3).dispatch("click");
+  assert.equal(h.state.itemReads, 2);
+  assert.equal(h.group(3).children[1].textContent, "No memos in this category.");
+});
+
+test("Return after editing finishes when another expanded category never responds", async () => {
+  const timers = manualTimers();
+  const h = await categoryHarness(timers);
+  await h.click("tags-tab");
+  await h.toggle(1).dispatch("click");
+  await h.toggle(2).dispatch("click");
+  h.window.scrollTo(0, 420);
+  await h.openMemo();
+  await h.click("edit-detail-title");
+  h.registry["title-editor-input"].value = "Updated";
+  await h.registry["title-editor-form"].dispatch("submit");
+  let signal;
+  h.state.itemResponse = (key, options) => {
+    if (key === 2) { signal = options.signal; return new Promise(() => {}); }
+  };
+  await h.back();
   assert.equal(h.window.scrollY, 0);
+  assert.equal(timers.size, 1);
+  timers.expire();
+  await flush();
+  assert.equal(signal.aborted, true);
+  assert.equal(h.window.scrollY, 420);
+  assert.equal(h.registry["refresh-button"].disabled, false);
+  assert.match(h.group(2).children[1].children[0].textContent, /timed out/);
+  h.state.itemResponse = null;
+  await h.group(2).children[1].children.at(-1).dispatch("click");
+  assert.ok(h.group(2).children[1].querySelector('[data-transcript-id="3"]'));
+  assert.equal(timers.size, 0);
+});
+
+test("Category timeout covers the response body and rejects late results", async () => {
+  const timers = manualTimers();
+  const h = await categoryHarness(timers);
+  await h.click("tags-tab");
+  let finishBody;
+  h.state.itemResponse = () => ({ok: true, status: 200, json: () => new Promise((resolve) => { finishBody = resolve; })});
+  const loading = h.toggle(1).dispatch("click");
+  await flush();
+  timers.expire();
+  await loading;
+  assert.match(h.group(1).children[1].children[0].textContent, /timed out/);
+  finishBody({items: [{id: 99, title: "Late", tags: []}]});
+  await flush();
+  assert.equal(h.group(1).children[1].querySelector('[data-transcript-id="99"]'), undefined);
+  assert.equal(timers.size, 0);
+});
+
+test("An emptied origin stays open without automatically opening another category", async () => {
+  const h = await categoryHarness();
+  await h.click("tags-tab");
+  await h.toggle(1).dispatch("click");
+  await h.openMemo();
+  await h.click("edit-detail-tags");
+  const inputs = h.registry["tag-picker-list"].querySelectorAll("input");
+  inputs.find((input) => input.value === "1").checked = false;
+  inputs.find((input) => input.value === "2").checked = true;
+  await h.registry["tag-picker-form"].dispatch("submit");
+  h.state.groups[1].items.push(h.state.groups[0].items[0]);
+  h.state.groups[0].items = [];
+  await h.back();
+  assert.equal(h.expanded(1), true);
+  assert.equal(h.expanded(2), false);
+  assert.equal(h.toggle(1).children[1].textContent, "#work · 0");
+  assert.equal(h.group(1).children[1].textContent, "No memos in this category.");
+});
+
+test("Collapsed and outdated category responses do not reopen or populate new views", async () => {
+  const h = await categoryHarness();
+  await h.click("tags-tab");
+  let finish;
+  h.state.itemResponse = () => new Promise((resolve) => { finish = resolve; });
+  const loading = h.toggle(1).dispatch("click");
+  await flush();
+  await h.toggle(1).dispatch("click");
+  finish(response({items: h.state.groups[0].items}));
+  await loading;
+  assert.equal(h.expanded(1), false);
+  await h.click("refresh-button");
+  const stale = h.toggle(1).dispatch("click");
+  await flush();
+  await h.click("date-tab");
+  finish(response({items: [{id: 99, title: "Stale", tags: []}]}));
+  await stale;
+  assert.equal(h.registry.groups.querySelector('[data-transcript-id="99"]'), undefined);
+});
+
+
+test("Category metadata loading times out and can be retried", async () => {
+  const timers = manualTimers();
+  const h = await categoryHarness(timers);
+  h.state.groupResponse = new Promise(() => {});
+  await h.click("tags-tab");
+  assert.equal(timers.size, 1);
+  timers.expire();
+  await flush();
+  assert.match(h.registry["list-status"].children[0].textContent, /timed out/);
+  assert.equal(h.registry["refresh-button"].disabled, false);
+  h.state.groupResponse = null;
+  await h.registry["list-status"].children.at(-1).dispatch("click");
+  assert.equal(h.registry.groups.children.length, 3);
+  assert.equal(timers.size, 0);
 });

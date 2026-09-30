@@ -11,7 +11,7 @@ from urllib.parse import urlencode
 
 from starlette.testclient import TestClient
 
-from vorec.library import group_by_date, group_by_tags
+from vorec.library import group_by_date
 from vorec.miniapp_auth import InvalidInitData, verify_init_data
 from vorec.miniapp_web import create_web_application
 from vorec.storage import TagRecord, TranscriptRecord, TranscriptStore, TranscriptSummary
@@ -105,30 +105,6 @@ class GroupingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             group_by_date(records, "not/a-zone")
 
-    def test_greedy_tags_recount_and_hide_only_grouping_tag(self) -> None:
-        a, b, c = TagRecord(1, "a"), TagRecord(2, "b"), TagRecord(3, "c")
-        records = [
-            TranscriptSummary(1, "2026-09-24T10:00:00+00:00", "One", (a, b)),
-            TranscriptSummary(2, "2026-09-23T10:00:00+00:00", "Two", (a, b)),
-            TranscriptSummary(3, "2026-09-22T10:00:00+00:00", "Three", (a, c)),
-            TranscriptSummary(4, "2026-09-21T10:00:00+00:00", "Four", (b,)),
-            TranscriptSummary(5, "2026-09-20T10:00:00+00:00", "Five", (c,)),
-            TranscriptSummary(6, "2026-09-19T10:00:00+00:00", "Six", ()),
-        ]
-        groups = group_by_tags(records)
-        self.assertEqual([group["tag"] for group in groups], ["a", "b", "c", None])
-        self.assertEqual([item["id"] for item in groups[0]["items"]], [1, 2, 3])
-        self.assertEqual(groups[0]["items"][0]["tags"], ["b"])
-        self.assertEqual([item["id"] for group in groups for item in group["items"]], [1, 2, 3, 4, 5, 6])
-        self.assertTrue(groups[-1]["untagged"])
-
-    def test_tie_breaks_by_freshness_then_name(self) -> None:
-        records = [
-            TranscriptSummary(1, "2026-09-23T10:00:00+00:00", "One", (TagRecord(2, "z"),)),
-            TranscriptSummary(2, "2026-09-24T10:00:00+00:00", "Two", (TagRecord(3, "c"),)),
-            TranscriptSummary(3, "2026-09-24T10:00:00+00:00", "Three", (TagRecord(1, "b"),)),
-        ]
-        self.assertEqual([group["tag"] for group in group_by_tags(records)], ["b", "c", "z"])
 
 
 class FakeApplication:
@@ -339,18 +315,36 @@ class MiniAppWebTests(unittest.TestCase):
                     "/apps/bot/api/groups?view=date&timezone=UTC", headers=headers
                 ).json()["groups"]
                 self.assertEqual(date_groups[0]["items"][0]["tags"], ["travel", "work"])
-                tag_groups = client.get(
-                    "/apps/bot/api/groups?view=tags&timezone=UTC", headers=headers
-                ).json()["groups"]
-                self.assertEqual(tag_groups[0]["items"][0]["id"], own_id)
+                with patch.object(store, "list_for_user", side_effect=AssertionError("Metadata must not load memos")):
+                    tag_groups = client.get(
+                        "/apps/bot/api/groups?view=tags&timezone=UTC", headers=headers
+                    ).json()["groups"]
+                self.assertEqual({group["tag"]: group["count"] for group in tag_groups},
+                                 {"travel": 1, "work": 1, None: 0})
+                self.assertTrue(all("items" not in group for group in tag_groups))
+                for selected in (work, travel):
+                    filtered = client.get(f"/apps/bot/api/transcripts?tag_id={selected.id}", headers=headers)
+                    self.assertEqual(filtered.status_code, 200)
+                    self.assertEqual([item["id"] for item in filtered.json()["items"]], [own_id])
+                    self.assertEqual(filtered.json()["items"][0]["tags"], ["travel", "work"])
+                    self.assertNotIn("text", filtered.json()["items"][0])
+                self.assertEqual(client.get("/apps/bot/api/transcripts?untagged=1", headers=headers).json(), {"items": []})
+                self.assertEqual(client.get(f"/apps/bot/api/transcripts?tag_id={other_tag.id}", headers=headers).status_code, 404)
+                self.assertEqual(client.get("/apps/bot/api/transcripts?tag_id=999999", headers=headers).status_code, 404)
+                self.assertEqual(client.get(f"/apps/bot/api/transcripts?tag_id={work.id}").status_code, 401)
+                for query in ("", "tag_id=0", "tag_id=-1", "tag_id=abc", "tag_id=9999999999999999999999", "untagged=0", "untagged=1&tag_id=1", "tag_id=1&tag_id=2", "unknown=1"):
+                    self.assertEqual(client.get("/apps/bot/api/transcripts?" + query, headers=headers).status_code, 400)
                 cleared = client.put(tag_url, json={"tag_ids": []}, headers=headers)
                 self.assertEqual(cleared.json()["tags"], [])
                 self.assertEqual(cleared.json()["tag_ids"], [])
                 tag_groups = client.get(
                     "/apps/bot/api/groups?view=tags&timezone=UTC", headers=headers
                 ).json()["groups"]
-                self.assertTrue(tag_groups[0]["untagged"])
-                self.assertEqual(tag_groups[0]["items"][0]["id"], own_id)
+                self.assertEqual({group["tag"]: group["count"] for group in tag_groups},
+                                 {"travel": 0, "work": 0, None: 1})
+                self.assertTrue(tag_groups[-1]["untagged"])
+                self.assertEqual(client.get("/apps/bot/api/transcripts?untagged=1", headers=headers).json()["items"][0]["id"], own_id)
+                self.assertEqual(client.get(f"/apps/bot/api/transcripts?tag_id={work.id}", headers=headers).json(), {"items": []})
 
     def test_title_suggestion_is_preview_and_title_update_preserves_tags(self) -> None:
         with TemporaryDirectory() as directory:
