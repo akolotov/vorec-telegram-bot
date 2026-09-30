@@ -84,9 +84,131 @@ function flush() {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
+test("Copy text preserves note content and isolates pending copies across notes", async () => {
+  const registry = {};
+  const html = fs.readFileSync(path.join(__dirname, "../miniapp/index.html"), "utf8");
+  for (const match of html.matchAll(/id="([^"]+)"/g)) {
+    new Element("div", registry).id = match[1];
+  }
+  const tagsParent = new Element("div", registry);
+  tagsParent.append(registry["detail-tags"]);
+  for (const id of ["detail-screen", "settings-screen", "tag-picker-screen", "title-editor-screen"]) {
+    registry[id].hidden = true;
+  }
+  const notes = [1, 2].map((id) => ({
+    id, created_at: "2026-09-24T10:00:00+00:00", title: `Title ${id}`,
+    text: id === 1 ? "  First line\n\nCafé 📝\nLast line  \n" : "Second note",
+    tags: ["work"], tag_ids: [1],
+  }));
+  const writes = [];
+  let finishCopy;
+  let failCopy;
+  const clipboard = {
+    writeText(text) {
+      assert.equal(this, clipboard);
+      writes.push(text);
+      return new Promise((resolve, reject) => {
+        finishCopy = resolve;
+        failCopy = reject;
+      });
+    },
+  };
+  const window = {
+    location: {href: "https://example.test/apps/bot/"}, scrollY: 0,
+    scrollTo() {}, navigator: {clipboard},
+    Telegram: {WebApp: {
+      initData: "signed-data", ready() {}, expand() {},
+      BackButton: {onClick() {}, hide() {}, show() {}},
+    }},
+  };
+  let requests = 0;
+  const fetch = async (url) => {
+    requests++;
+    if (url.pathname.endsWith("/api/groups")) {
+      return response({groups: [{key: "2026-09-24", items: notes}]});
+    }
+    const note = notes.find((item) => url.pathname.endsWith(`/api/transcripts/${item.id}`));
+    if (note) return response(note);
+    throw new Error(`Unexpected request: ${url}`);
+  };
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname, "../miniapp/app.js"), "utf8"), {
+    window, fetch, URL, URLSearchParams, Intl,
+    document: {
+      getElementById: (id) => registry[id],
+      createElement: (tag) => new Element(tag, registry),
+      createTextNode: (value) => new Element(value, registry),
+    },
+    requestAnimationFrame: (callback) => callback(),
+  });
+  await flush();
+  const open = async (id) => {
+    await registry.groups.querySelector(`[data-transcript-id="${id}"]`).dispatch("click");
+    await flush();
+  };
+  await open(1);
+  const button = registry["copy-detail-text"];
+  const status = registry["copy-detail-status"];
+  const requestsBeforeCopy = requests;
+  const copying = button.dispatch("click");
+  assert.deepEqual(writes, [notes[0].text]);
+  assert.equal(button.disabled, true);
+  assert.equal(status.textContent, "");
+  await button.dispatch("click");
+  assert.equal(writes.length, 1);
+  finishCopy();
+  await copying;
+  assert.equal(button.disabled, false);
+  assert.equal(status.textContent, "Copied");
+  assert.equal(requests, requestsBeforeCopy);
+
+  const failing = button.dispatch("click");
+  assert.equal(status.textContent, "");
+  failCopy(new Error("Permission denied"));
+  await failing;
+  assert.equal(status.textContent, "Could not copy text. Please try again.");
+  assert.equal(button.disabled, false);
+
+  window.navigator.clipboard = undefined;
+  await button.dispatch("click");
+  assert.equal(status.textContent, "Copying is unavailable in this client.");
+  assert.equal(button.disabled, false);
+  window.navigator.clipboard = {writeText() { throw new Error("Blocked"); }};
+  await button.dispatch("click");
+  assert.equal(status.textContent, "Could not copy text. Please try again.");
+  assert.equal(button.disabled, false);
+  window.navigator.clipboard = clipboard;
+
+  const staleCopy = button.dispatch("click");
+  const finishOldCopy = finishCopy;
+  await registry["back-button"].dispatch("click");
+  await open(2);
+  assert.equal(status.textContent, "");
+  assert.equal(button.disabled, false);
+  const newCopy = button.dispatch("click");
+  assert.equal(writes.at(-1), notes[1].text);
+  finishOldCopy();
+  await staleCopy;
+  assert.equal(status.textContent, "");
+  assert.equal(button.disabled, true);
+  finishCopy();
+  await newCopy;
+  assert.equal(status.textContent, "Copied");
+  assert.equal(button.disabled, false);
+
+  const staleFailure = button.dispatch("click");
+  const rejectOldCopy = failCopy;
+  await registry["back-button"].dispatch("click");
+  await open(1);
+  rejectOldCopy(new Error("Late failure"));
+  await staleFailure;
+  assert.equal(status.textContent, "");
+  assert.equal(button.disabled, false);
+});
+
 test("Tag picker blocks navigation during save and handles failed saves", async () => {
   const registry = {};
   const ids = [
+    "copy-detail-text", "copy-detail-status",
     "list-screen", "detail-screen", "settings-screen", "tag-picker-screen",
     "title-editor-screen", "title-editor-input", "title-editor-status",
     "title-editor-apply", "title-editor-cancel", "title-editor-generate",
@@ -230,6 +352,7 @@ test("Tag picker blocks navigation during save and handles failed saves", async 
 test("Title editor previews AI titles, saves on Apply, and resolves uncertain saves", async () => {
   const registry = {};
   const ids = [
+    "copy-detail-text", "copy-detail-status",
     "list-screen", "detail-screen", "settings-screen", "tag-picker-screen",
     "title-editor-screen", "title-editor-input", "title-editor-status",
     "title-editor-apply", "title-editor-cancel", "title-editor-generate",
@@ -432,6 +555,7 @@ test("Title editor previews AI titles, saves on Apply, and resolves uncertain sa
 test("Refresh reloads the current view at the top and preserves detail return position", async () => {
   const registry = {};
   const ids = [
+    "copy-detail-text", "copy-detail-status",
     "list-screen", "detail-screen", "settings-screen", "tag-picker-screen",
     "title-editor-screen", "title-editor-input", "title-editor-status",
     "title-editor-apply", "title-editor-cancel", "title-editor-generate",

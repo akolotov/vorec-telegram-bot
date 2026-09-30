@@ -60,6 +60,8 @@ h1 { margin: 0 0 20px; font-size: 29px; line-height: 1.2; letter-spacing: -.02em
 .detail-date { margin: 0 0 8px; color: var(--muted); font-size: 13px; }
 .detail-title-row { display: flex; align-items: flex-start; gap: 8px; }
 #detail-title { flex: 1; min-width: 0; margin-bottom: 10px; overflow-wrap: anywhere; }
+.copy-detail-status { color: var(--muted); font-size: 13px; text-align: right; overflow-wrap: anywhere; }
+.copy-detail-status:not(:empty) { margin-bottom: 10px; }
 .detail-tags-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
 .detail-tags-row .tags { flex: 1; min-width: 0; }
 .detail-tags-row button { flex: none; padding: 6px 9px; border-radius: 9px; cursor: pointer; font-size: 13px; }
