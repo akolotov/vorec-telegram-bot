@@ -238,7 +238,7 @@
       const heading = document.createElement("h2");
       heading.className = "group-title";
       heading.textContent = currentView === "date" ? formatDay(group.key)
-        : `${group.untagged ? "Uncategorized" : `#${group.tag}`} · ${group.count}`;
+        : group.untagged ? "Uncategorized" : `#${group.tag}`;
       section.append(heading);
       if (currentView === "date") {
         renderItems(group, section, group.items, false);
@@ -253,8 +253,12 @@
         indicator.className = "category-indicator";
         indicator.setAttribute("aria-hidden", "true");
         const name = document.createElement("span");
+        name.className = "category-name";
         name.textContent = heading.textContent;
-        toggle.append(indicator, name);
+        const count = document.createElement("span");
+        count.className = "category-count";
+        count.textContent = String(group.count);
+        toggle.append(indicator, name, count);
         const updateExpanded = () => {
           const expanded = expandedCategories.has(group.key);
           container.hidden = !expanded;

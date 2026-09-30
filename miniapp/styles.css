@@ -46,12 +46,14 @@ h1 { margin: 0 0 20px; font-size: 29px; line-height: 1.2; letter-spacing: -.02em
   cursor: pointer;
 }
 .tab.active { background: var(--accent); color: #fff; font-weight: 600; }
-.group { margin: 0 0 18px; padding: 15px 16px 3px; background: var(--surface); border-radius: 16px; }
+.group { margin: 0 0 8px; padding: 15px 16px 3px; background: var(--surface); border-radius: 16px; }
 .group-title { margin: 0 0 6px; font-size: 16px; font-weight: 700; }
 .category-group { padding: 0 16px; }
 .category-group .group-title { margin: 0; }
 .category-toggle { display: flex; align-items: center; gap: 8px; width: 100%; padding: 15px 0; border: 0; background: none; color: var(--text); text-align: left; font-weight: 700; cursor: pointer; overflow-wrap: anywhere; }
 .category-indicator { flex: none; width: 16px; color: var(--muted); }
+.category-name { flex: 1; min-width: 0; }
+.category-count { flex: none; color: var(--muted); font-weight: 500; font-variant-numeric: tabular-nums; }
 .transcript { width: 100%; padding: 13px 0 14px; border: 0; border-top: 1px solid var(--border); background: none; color: var(--text); text-align: left; cursor: pointer; }
 .transcript:first-of-type { border-top: 0; }
 .transcript-title { display: block; overflow-wrap: anywhere; font-weight: 500; }

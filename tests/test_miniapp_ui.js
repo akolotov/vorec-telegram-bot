@@ -856,7 +856,8 @@ test("Categories sort by complete membership and load only on expansion with cac
   await h.click("tags-tab");
   assert.deepEqual(h.registry.groups.children.map((section) => section.dataset.groupKey), ["2", "1", "4", "3", "untagged"]);
   assert.equal(h.state.itemReads || 0, 0);
-  assert.equal(h.toggle(1).children[1].textContent, "#work · 2");
+  assert.equal(h.toggle(1).children[1].textContent, "#work");
+  assert.equal(h.toggle(1).children[2].textContent, "2");
   await h.toggle(2).dispatch("click");
   assert.equal(h.state.itemReads, 1);
   const shared = h.group(2).children[1].querySelector('[data-transcript-id="1"]');
@@ -933,7 +934,8 @@ test("An emptied origin stays open without automatically opening another categor
   await h.back();
   assert.equal(h.expanded(1), true);
   assert.equal(h.expanded(2), false);
-  assert.equal(h.toggle(1).children[1].textContent, "#work · 0");
+  assert.equal(h.toggle(1).children[1].textContent, "#work");
+  assert.equal(h.toggle(1).children[2].textContent, "0");
   assert.equal(h.group(1).children[1].textContent, "No memos in this category.");
 });
 
