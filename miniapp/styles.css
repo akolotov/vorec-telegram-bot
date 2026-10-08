@@ -17,6 +17,7 @@ body {
   font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 button { font: inherit; }
+body.tag-picker-open { overflow: hidden; }
 .page {
   max-width: 720px;
   margin: 0 auto;
@@ -74,6 +75,23 @@ h1 { margin: 0 0 20px; font-size: 29px; line-height: 1.2; letter-spacing: -.02em
 .detail-text { margin-top: 26px; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.65; }
 .tag-picker-actions { display: flex; gap: 10px; margin-bottom: 24px; }
 .tag-picker-actions button { padding: 8px 13px; border-radius: 9px; cursor: pointer; }
+#tag-picker-screen {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: var(--tg-viewport-height, 100vh);
+  max-width: 720px;
+  margin: 0 auto;
+  padding: inherit;
+  background: var(--background);
+}
+@supports (height: 100dvh) {
+  #tag-picker-screen { height: var(--tg-viewport-height, 100dvh); }
+}
+#tag-picker-form { display: flex; flex-direction: column; height: 100%; }
+#tag-picker-form > :not(#tag-picker-list) { flex-shrink: 0; }
+#tag-picker-list { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior-y: contain; }
 .title-editor-label { display: block; margin-bottom: 8px; font-weight: 600; font-size: 14px; }
 .title-editor-field { display: flex; align-items: center; gap: 8px; }
 .title-editor-field input { flex: 1; min-width: 0; padding: 10px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); color: var(--text); font: inherit; }

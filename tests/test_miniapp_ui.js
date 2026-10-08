@@ -16,7 +16,11 @@ class Element {
     this.checked = false;
     this.textContent = "";
     this.attributes = {};
-    this.classList = {toggle() {}};
+    const classes = new Set();
+    this.classList = {
+      toggle(name, enabled) { if (enabled) classes.add(name); else classes.delete(name); },
+      contains(name) { return classes.has(name); },
+    };
   }
 
   set id(value) {
@@ -135,6 +139,7 @@ test("Copy text preserves note content and isolates pending copies across notes"
   vm.runInNewContext(fs.readFileSync(path.join(__dirname, "../miniapp/app.js"), "utf8"), {
     window, fetch, URL, URLSearchParams, Intl,
     document: {
+      body: new Element("body", registry),
       getElementById: (id) => registry[id],
       createElement: (tag) => new Element(tag, registry),
       createTextNode: (value) => new Element(value, registry),
@@ -242,6 +247,7 @@ test("Tag picker blocks navigation during save and handles failed saves", async 
   const updated = {...initial, tags: ["travel"], tag_ids: [2]};
   let memo = initial;
   const document = {
+    body: new Element("body", registry),
     getElementById: (id) => registry[id],
     createElement: (tag) => new Element(tag, registry),
     createTextNode: (value) => new Element(value, registry),
@@ -299,6 +305,9 @@ test("Tag picker blocks navigation during save and handles failed saves", async 
   await flush();
   await registry["edit-detail-tags"].dispatch("click");
   await flush();
+  assert.equal(document.body.classList.contains("tag-picker-open"), true);
+  assert.equal(registry["tag-picker-list"].scrollTop, 0);
+  registry["tag-picker-list"].scrollTop = 500;
   const inputs = registry["tag-picker-list"].querySelectorAll("input");
   inputs.find((input) => input.value === "1").checked = false;
   inputs.find((input) => input.value === "2").checked = true;
@@ -317,6 +326,7 @@ test("Tag picker blocks navigation during save and handles failed saves", async 
   await saving;
   assert.equal(registry["detail-screen"].hidden, false);
   assert.equal(registry["tag-picker-screen"].hidden, true);
+  assert.equal(document.body.classList.contains("tag-picker-open"), false);
   assert.equal(registry["detail-tags"].children[0].textContent, "#travel");
   telegramBack();
   await flush();
@@ -327,6 +337,7 @@ test("Tag picker blocks navigation during save and handles failed saves", async 
   await registry["edit-detail-tags"].dispatch("click");
   await flush();
   const retryInputs = registry["tag-picker-list"].querySelectorAll("input");
+  assert.equal(registry["tag-picker-list"].scrollTop, 0);
   retryInputs.find((input) => input.value === "1").checked = true;
   retryInputs.find((input) => input.value === "2").checked = false;
   rejectNextPut = true;
@@ -335,6 +346,7 @@ test("Tag picker blocks navigation during save and handles failed saves", async 
   assert.equal(registry["tag-picker-cancel"].disabled, false);
   await registry["tag-picker-cancel"].dispatch("click");
   assert.equal(registry["detail-screen"].hidden, false);
+  assert.equal(document.body.classList.contains("tag-picker-open"), false);
   assert.equal(registry["detail-tags"].children[0].textContent, "#travel");
 
   await registry["edit-detail-tags"].dispatch("click");
@@ -403,6 +415,7 @@ test("Title editor previews AI titles, saves on Apply, and resolves uncertain sa
     }},
   };
   const document = {
+    body: new Element("body", registry),
     getElementById: (id) => registry[id],
     createElement: (tag) => new Element(tag, registry),
     createTextNode: (value) => new Element(value, registry),
@@ -585,6 +598,7 @@ test("Refresh reloads the current view at the top and preserves detail return po
     }},
   };
   const document = {
+    body: new Element("body", registry),
     getElementById: (id) => registry[id],
     createElement: (tag) => new Element(tag, registry),
     createTextNode: (value) => new Element(value, registry),
@@ -718,6 +732,7 @@ async function categoryHarness(timers = {setTimeout, clearTimeout}) {
   };
   vm.runInNewContext(fs.readFileSync(path.join(__dirname, "../miniapp/app.js"), "utf8"), {
     document: {
+      body: new Element("body", registry),
       getElementById: (id) => registry[id],
       createElement(tag) {
         const element = new Element(tag, registry);
