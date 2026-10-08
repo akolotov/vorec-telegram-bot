@@ -42,12 +42,16 @@ Telegram → Tailscale Funnel → tailscale-ingress → bot container
 - **Merge model** receives both transcripts through the primary inference provider and combines
   their best-supported readings into one readable result. Both transcriptions are always
   made: the bot does not currently try to judge the quality of the first result.
-- **Title model** receives the merged transcript and the user's available tag names and
-  descriptions through the primary inference provider. One structured response creates the
-  short title and gives a true/false decision for every personal tag, with an explanation
-  when none match. The optional `TITLE_MODEL` environment variable selects the model.
-  After three unsuccessful attempts, the bot saves the transcript
-  with its first 50 characters as the title and no tags.
+- **Title model** receives the merged transcript through the primary inference provider.
+  A structured request creates a short title using the same generator as the Mini App.
+  A separate request classifies every personal tag as true or false using its name and
+  description, with an explanation when none match. The tag request is skipped when
+  no tags are available. Both requests use `TITLE_MODEL`, run sequentially, and release
+  the provider between stages. Each request has a 60-second timeout and up to three
+  attempts for invalid or truncated responses. Provider errors are not retried.
+  If title generation fails, the bot uses the first 50 transcript characters. If tag
+  generation fails, it uses no tags. A failure in either operation preserves the
+  successful result of the other. Two requests send the transcript twice when tags exist.
 - **oMLX** is the current local inference provider. It is not required by the architecture:
   configure any OpenAI-compatible providers with `INFERENCE_API_URL`, `INFERENCE_API_KEY`,
   `SECONDARY_INFERENCE_API_URL`, and `SECONDARY_INFERENCE_API_KEY`.
@@ -193,7 +197,10 @@ message ID (`YYYY-MM-DD_HH-MM-SS_<chat-id>_<message-id>`):
 
 - `data/voices/YYYY-MM/<recording-id>.<extension>` contains the downloaded audio.
 - `data/transcripts/YYYY-MM/<recording-id>/` contains the `primary`, `secondary`, `merged`, and
-  successful `title` responses in both `.json` and `.txt` formats.
+  successful `title` and `tags` responses in both `.json` and `.txt` formats.
+  `tags.txt` contains selected names, one per line without `#`; it is empty when none
+  match. No tag artifacts are created when the catalog is empty. Metadata artifact
+  write failures are logged without discarding generated titles or tags.
 - `data/vorec.sqlite3` indexes completed transcripts by Telegram user and creation time. It stores
   the final text, title, and personal tags together with paths to the audio and artifact
   directory relative to `data/`.
@@ -257,8 +264,10 @@ By default, this phase reads every transcript already in the database, including
 imports. To regenerate only specific database records, add `--transcript-ids 6 13 23` (with the
 desired IDs). It uses the primary inference provider and `TITLE_MODEL` from `.env` to replace titles
 and tag assignments for those records. It does not read the filesystem archive and does not need
-user or chat IDs. If inference fails for a transcript, the command keeps its current title, clears
-its tags, continues, and reports the failure count while exiting with status 0. Stop the bot before
+user or chat IDs. Title and tag generation use separate requests with 60-second timeouts. If title
+generation fails, the command keeps the current title; if tag generation fails, it
+clears the tags. Each successful result is saved independently. The command continues
+and counts a record once if either operation fails, while exiting with status 0. Stop the bot before
 writing to the database.
 
 ## Management

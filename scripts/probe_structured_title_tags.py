@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from pydantic import ValidationError
 
-from vorec.audio import generate_transcript_title
+from vorec.audio import generate_title_only, generate_transcript_tags
 from vorec.storage import TagDefinition
 
 TAGS = (
@@ -83,19 +83,21 @@ def main() -> None:
     for label, transcript in examples:
         started = time.monotonic()
         print(f"\nCase: {label}", flush=True)
-        try:
-            response, title, selected_tags = generate_transcript_title(
-                transcript, client, model, tags
-            )
-            print("Validated: yes")
-            print("Model JSON:", response["choices"][0]["message"]["content"])
-            print(f"Title: {title}")
-            print(f"Selected tags: {list(selected_tags)}")
-        except Exception as error:
-            # Deliberately avoid printing exception text: it can include endpoint details.
-            print(f"Validated: no; error type: {type(error).__name__}")
-            if isinstance(error, ValidationError):
-                print("Validation issues:", error.errors(include_input=False))
+        for stage, operation in (
+            ("Title", lambda: generate_title_only(transcript, client, model, timeout=60)),
+            ("Tags", lambda: generate_transcript_tags(transcript, client, model, tags)),
+        ):
+            try:
+                response, result = operation()
+                print(f"{stage} validated: yes")
+                if response:
+                    print(f"{stage} JSON:", response["choices"][0]["message"]["content"])
+                print(f"{stage} result: {result}")
+            except Exception as error:
+                # Avoid exception text, which can include private endpoint details.
+                print(f"{stage} validated: no; error type: {type(error).__name__}")
+                if isinstance(error, ValidationError):
+                    print("Validation issues:", error.errors(include_input=False))
         print(f"Elapsed: {time.monotonic() - started:.1f}s", flush=True)
 
 

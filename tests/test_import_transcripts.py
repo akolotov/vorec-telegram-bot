@@ -173,7 +173,7 @@ class TranscriptImportTests(unittest.TestCase):
             with (
                 patch("vorec.import_transcripts.load_dotenv") as load_env,
                 patch("vorec.import_transcripts.OpenAI") as client_class,
-                patch("vorec.import_transcripts.generate_transcript_title") as generation,
+                patch("vorec.import_transcripts.generate_title_only") as generation,
                 redirect_stdout(io.StringIO()) as import_output,
             ):
                 result = main([
@@ -197,15 +197,15 @@ class TranscriptImportTests(unittest.TestCase):
             )
             store.save_with_tags(existing, (old_tag.id,))
 
-            def generate(text, client, model, tags):
+            def generate_tags(text, client, model, tags):
                 self.assertIs(client, mock_client)
                 self.assertEqual(model, "test-model")
                 if text == "Existing text":
                     self.assertEqual({tag.id for tag in tags}, {old_tag.id, new_tag.id})
-                    return {}, "Generated existing", ("new",)
+                    return {}, ("new",)
                 self.assertEqual(text, "Archive text")
                 self.assertEqual(tags, (archive_tag,))
-                return {}, "Generated archive", ("archive",)
+                return {}, ("archive",)
 
             mock_client = Mock()
             with (
@@ -217,7 +217,9 @@ class TranscriptImportTests(unittest.TestCase):
                 patch("vorec.import_transcripts.load_dotenv"),
                 patch("vorec.import_transcripts.OpenAI", return_value=mock_client),
                 patch("vorec.import_transcripts.collect_records") as collect,
-                patch("vorec.import_transcripts.generate_transcript_title", side_effect=generate) as generation,
+                patch("vorec.import_transcripts.generate_transcript_tags", side_effect=generate_tags) as generation,
+                patch("vorec.import_transcripts.generate_title_only",
+                      side_effect=lambda text, *_args, **_kwargs: ({}, "Generated existing" if text == "Existing text" else "Generated archive")),
                 redirect_stdout(io.StringIO()) as output,
             ):
                 result = main([
@@ -272,7 +274,8 @@ class TranscriptImportTests(unittest.TestCase):
                 }),
                 patch("vorec.import_transcripts.load_dotenv"),
                 patch("vorec.import_transcripts.OpenAI"),
-                patch("vorec.import_transcripts.generate_transcript_title", side_effect=RuntimeError("provider error")),
+                patch("vorec.import_transcripts.generate_title_only", side_effect=RuntimeError("provider error")),
+                patch("vorec.import_transcripts.generate_transcript_tags", side_effect=RuntimeError("provider error")),
                 redirect_stdout(output),
             ):
                 result = main([
@@ -307,20 +310,46 @@ class TranscriptImportTests(unittest.TestCase):
             output = io.StringIO()
 
             with (
-                patch("vorec.import_transcripts.generate_transcript_title", side_effect=[
-                    RuntimeError("provider error"), ({}, "New title", ()),
+                patch("vorec.import_transcripts.generate_title_only", side_effect=[
+                    RuntimeError("provider error"), ({}, "New title"),
                 ]) as generation,
+                patch("vorec.import_transcripts.generate_transcript_tags",
+                      side_effect=[RuntimeError("provider error"), ({}, ())]) as tag_generation,
                 redirect_stdout(output),
             ):
                 count, failures = regenerate_titles_and_tags(store, Mock(), "test-model")
 
             self.assertEqual((count, failures), (2, 1))
             self.assertEqual(generation.call_count, 2)
-            self.assertEqual(generation.call_args_list[1].args[3], ())
-            self.assertIn("keeping its title and clearing tags", output.getvalue())
+            self.assertEqual(tag_generation.call_args_list[1].args[3], ())
+            self.assertIn("keeping its title", output.getvalue())
+            self.assertIn("clearing tags", output.getvalue())
             self.assertEqual(store.list_for_user(111)[0].title, "Keep this title")
             self.assertEqual(store.list_for_user(111)[0].tags, ())
             self.assertEqual(store.list_for_user(333)[0].title, "New title")
+
+    def test_regeneration_preserves_each_success_and_counts_failed_records_once(self):
+        for title_fails, tags_fail in ((False, False), (True, False), (False, True), (True, True)):
+            with self.subTest(title=title_fails, tags=tags_fail), TemporaryDirectory() as directory:
+                store = TranscriptStore(Path(directory) / "vorec.sqlite3")
+                store.initialize()
+                tag = store.create_tag(111, "work", "Work")
+                record = TranscriptRecord(111, 222, 1, "2026-09-22T10:20:30+00:00",
+                    "Old title", "Text", "voices/audio.ogg", "transcripts/audio")
+                store.save(record)
+                with (patch("vorec.import_transcripts.generate_title_only",
+                            return_value=({}, "New title"),
+                            side_effect=RuntimeError("title") if title_fails else None) as title,
+                      patch("vorec.import_transcripts.generate_transcript_tags",
+                            return_value=({}, ("work",)),
+                            side_effect=RuntimeError("tags") if tags_fail else None),
+                      redirect_stdout(io.StringIO())):
+                    count, failures = regenerate_titles_and_tags(store, Mock(), "model")
+                self.assertEqual((count, failures), (1, int(title_fails or tags_fail)))
+                self.assertEqual(title.call_args.kwargs, {"timeout": 60})
+                saved = store.list_for_user(111)[0]
+                self.assertEqual(saved.title, "Old title" if title_fails else "New title")
+                self.assertEqual(tuple(t.id for t in saved.tags), () if tags_fail else (tag.id,))
 
     def test_regeneration_selects_only_requested_database_ids(self) -> None:
         with TemporaryDirectory() as directory:
@@ -347,9 +376,10 @@ class TranscriptImportTests(unittest.TestCase):
                 patch("vorec.import_transcripts.load_dotenv"),
                 patch("vorec.import_transcripts.OpenAI"),
                 patch(
-                    "vorec.import_transcripts.generate_transcript_title",
-                    side_effect=lambda text, *_: ({}, f"Generated {text}", ()),
+                    "vorec.import_transcripts.generate_title_only",
+                    side_effect=lambda text, *_, **_kwargs: ({}, f"Generated {text}"),
                 ) as generation,
+                patch("vorec.import_transcripts.generate_transcript_tags", return_value=({}, ())),
                 redirect_stdout(io.StringIO()) as output,
             ):
                 result = main([
@@ -382,7 +412,7 @@ class TranscriptImportTests(unittest.TestCase):
             )
             store.save(record)
             record_id = store.list_all_records_with_ids()[0][0]
-            with patch("vorec.import_transcripts.generate_transcript_title") as generation:
+            with patch("vorec.import_transcripts.generate_title_only") as generation:
                 for ids in ((0,), (record_id, record_id), (record_id, 999)):
                     with self.subTest(ids=ids), self.assertRaises(TranscriptStorageError):
                         regenerate_titles_and_tags(store, Mock(), "test-model", ids)

@@ -12,7 +12,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from vorec.audio import generate_transcript_title
+from vorec.audio import generate_title_only, generate_transcript_tags
 from vorec.storage import TranscriptRecord, TranscriptStorageError, TranscriptStore
 
 
@@ -218,22 +218,31 @@ def regenerate_titles_and_tags(
     failures = 0
     for index, (record_id, record) in enumerate(records, start=1):
         available_tags = tags_by_user[record.telegram_user_id]
+        failed = False
+        title = record.title
+        selected_ids: tuple[int, ...] = ()
         try:
-            _, title, selected_names = generate_transcript_title(
+            _, title = generate_title_only(record.text, client, model, timeout=60)
+        except Exception as error:
+            failed = True
+            print(
+                f"Title generation failed for transcript ID {record_id} "
+                f"({index}/{len(records)}) ({error.__class__.__name__}); keeping its title."
+            )
+        try:
+            _, selected_names = generate_transcript_tags(
                 record.text, client, model, available_tags
             )
             selected_ids = tuple(
                 tag.id for tag in available_tags if tag.name in selected_names
             )
         except Exception as error:
-            failures += 1
+            failed = True
             print(
-                f"Title and tag generation failed for transcript ID {record_id} "
-                f"({index}/{len(records)}) "
-                f"({error.__class__.__name__}); keeping its title and clearing tags."
+                f"Tag generation failed for transcript ID {record_id} "
+                f"({index}/{len(records)}) ({error.__class__.__name__}); clearing tags."
             )
-            title = record.title
-            selected_ids = ()
+        failures += int(failed)
         store.save_with_tags(replace(record, title=title), selected_ids)
     return len(records), failures
 
