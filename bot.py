@@ -14,6 +14,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from typing import TypeVar
 from urllib.parse import urlparse
@@ -32,7 +33,7 @@ from vorec.audio import (
     merge_transcripts,
     prepare_wav,
     resolve_converter,
-    generate_transcript_title,
+    generate_transcript_tags,
     transcribe_audio,
 )
 from vorec.scheduling import TranscriptionResource, TranscriptionScheduler
@@ -53,11 +54,13 @@ FIRST_TRANSCRIPT_STATUS = "Creating the first transcript…"
 SECOND_TRANSCRIPT_STATUS = "Creating the second transcript…"
 MERGING_STATUS = "Merging transcripts…"
 TITLE_STATUS = "Generating title…"
+TAGS_STATUS = "Generating tags…"
 WAITING_FOR_PREPARATION_STATUS = "Waiting to prepare audio…"
 WAITING_FOR_FIRST_TRANSCRIPT_STATUS = "Waiting to create the first transcript…"
 WAITING_FOR_SECOND_TRANSCRIPT_STATUS = "Waiting to create the second transcript…"
 WAITING_FOR_MERGE_STATUS = "Waiting to merge transcripts…"
 WAITING_FOR_TITLE_STATUS = "Waiting to generate title…"
+WAITING_FOR_TAGS_STATUS = "Waiting to generate tags…"
 WAITING_FOR_TRANSCRIPTION_PROVIDER_STATUS = "Waiting for a transcription provider…"
 WAITING_FOR_PRIMARY_INFERENCE_STATUS = "Waiting for the primary inference provider…"
 WAITING_FOR_SECONDARY_INFERENCE_STATUS = "Waiting for the secondary inference provider…"
@@ -698,54 +701,71 @@ async def transcribe_recording(
 
         title = transcript[:TRANSCRIPT_TITLE_LENGTH]
         selected_tags: tuple[str, ...] = ()
-        try:
-            stage_started = time.monotonic()
-            LOGGER.info("Starting transcript title through the inference provider.")
-            if scheduler is None:
-                title_result, title, selected_tags = await run_serial_stage(
-                    stage_locks.primary,
-                    WAITING_FOR_TITLE_STATUS,
-                    TITLE_STATUS,
-                    generate_transcript_title,
-                    transcript,
-                    primary_inference_client,
-                    title_model,
-                    available_tags,
-                    progress=progress,
-                )
-            else:
-                async def report_title_waiting() -> None:
-                    if progress is not None:
-                        await progress(WAITING_FOR_TITLE_STATUS)
 
-                async with scheduler.reserve(
-                    (TranscriptionResource.PRIMARY,),
-                    on_wait=report_title_waiting,
-                ):
-                    if progress is not None:
-                        await progress(TITLE_STATUS)
-                    title_result, title, selected_tags = await run_blocking_operation(
-                        generate_transcript_title,
-                        transcript,
-                        primary_inference_client,
-                        title_model,
-                        available_tags,
-                    )
-            if artifacts_directory is not None:
-                save_transcription_artifact(
-                    artifacts_directory, "title", title_result, title
+        async def metadata_stage(
+            operation: Callable[[], T], waiting_status: str, active_status: str
+        ) -> T:
+            if scheduler is None:
+                return await run_serial_stage(
+                    stage_locks.primary, waiting_status, active_status,
+                    operation, progress=progress,
                 )
-            LOGGER.info(
-                "Transcript title completed in %.1f s.",
-                time.monotonic() - stage_started,
+
+            async def report_waiting() -> None:
+                if progress is not None:
+                    await progress(waiting_status)
+
+            async with scheduler.reserve(
+                (TranscriptionResource.PRIMARY,), on_wait=report_waiting,
+            ):
+                if progress is not None:
+                    await progress(active_status)
+                return await run_blocking_operation(operation)
+
+        def save_metadata_artifact(name: str, response: dict, text: str) -> None:
+            if artifacts_directory is None:
+                return
+            try:
+                save_transcription_artifact(artifacts_directory, name, response, text)
+            except Exception as error:
+                LOGGER.warning(
+                    "Could not save %s artifact (%s).", name, error.__class__.__name__,
+                )
+
+        stage_started = time.monotonic()
+        LOGGER.info("Starting transcript title through the inference provider.")
+        try:
+            title_result, title = await metadata_stage(
+                partial(generate_title_only, transcript, primary_inference_client,
+                        title_model, timeout=60),
+                WAITING_FOR_TITLE_STATUS, TITLE_STATUS,
             )
         except Exception as error:
             LOGGER.warning(
-                "Transcript title failed (%s); using the transcript prefix instead.",
-                error.__class__.__name__,
+                "Transcript title failed after %.1f s (%s); using the transcript prefix instead.",
+                time.monotonic() - stage_started, error.__class__.__name__,
             )
-            title = transcript[:TRANSCRIPT_TITLE_LENGTH]
-            selected_tags = ()
+        else:
+            save_metadata_artifact("title", title_result, title)
+            LOGGER.info("Transcript title completed in %.1f s.", time.monotonic() - stage_started)
+
+        if available_tags:
+            stage_started = time.monotonic()
+            LOGGER.info("Starting transcript tags through the inference provider.")
+            try:
+                tags_result, selected_tags = await metadata_stage(
+                    partial(generate_transcript_tags, transcript, primary_inference_client,
+                            title_model, available_tags),
+                    WAITING_FOR_TAGS_STATUS, TAGS_STATUS,
+                )
+            except Exception as error:
+                LOGGER.warning(
+                    "Transcript tags failed after %.1f s (%s); using no tags.",
+                    time.monotonic() - stage_started, error.__class__.__name__,
+                )
+            else:
+                save_metadata_artifact("tags", tags_result, "\n".join(selected_tags))
+                LOGGER.info("Transcript tags completed in %.1f s.", time.monotonic() - stage_started)
 
         LOGGER.info("Transcription pipeline completed in %.1f s.", time.monotonic() - pipeline_started)
         return transcript, title, selected_tags
@@ -789,7 +809,10 @@ def save_transcription_artifact(
     (artifacts_directory / f"{name}.json").write_text(
         json.dumps(response, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
-    (artifacts_directory / f"{name}.txt").write_text(text.strip() + "\n", encoding="utf-8")
+    cleaned_text = text.strip()
+    (artifacts_directory / f"{name}.txt").write_text(
+        cleaned_text + "\n" if cleaned_text else "", encoding="utf-8"
+    )
 
 
 def utc_timestamp(value: datetime) -> str:
@@ -1018,7 +1041,7 @@ def main() -> None:
                 job_id, started_at - queued_at,
             )
             try:
-                title = await run_blocking_operation(
+                _, title = await run_blocking_operation(
                     generate_title_only, transcript, primary_inference_client, title_model
                 )
             except Exception as error:
