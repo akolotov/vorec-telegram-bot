@@ -332,6 +332,7 @@
     detailScreen.hidden = true;
     titleEditorScreen.hidden = true;
     tagPickerScreen.hidden = true;
+    document.body.classList.toggle("tag-picker-open", false);
     const returningFromSettings = !settingsScreen.hidden;
     settingsScreen.hidden = true;
     listScreen.hidden = false;
@@ -612,6 +613,8 @@
   function openTagPicker() {
     detailScreen.hidden = true;
     tagPickerScreen.hidden = false;
+    document.body.classList.toggle("tag-picker-open", true);
+    tagPickerList.scrollTop = 0;
     tagPickerCancel.disabled = false;
     saveUncertain = false;
     webApp?.BackButton?.show();
@@ -622,6 +625,7 @@
   function returnToDetail() {
     ++pickerRequestNumber;
     tagPickerScreen.hidden = true;
+    document.body.classList.toggle("tag-picker-open", false);
     detailScreen.hidden = false;
     webApp?.BackButton?.show();
     window.scrollTo(0, 0);
